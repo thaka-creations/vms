@@ -340,33 +340,44 @@ EOF
     success "Logrorate for auditd logs "
 }
 
+safe_chmod(){
+    local mode="$1"
+    local target="$2"
+    if [ -e "$target" ]; then
+        chmod "$mode" "$target"
+    else
+        warning "Skipping chmod $mode $target — path does not exist"
+    fi
+}
+
 set_file_permissions(){
-    chmod 0600 /etc/ssh/sshd_config
-    chmod 0600 /etc/shadow
-    chmod 0600 /etc/gshadow
-    chmod 0644 /etc/passwd
-    chmod 0644 /etc/group
-    chmod 0600 /etc/crontab
-    chmod 0700 /etc/cron.d
-    chmod 0700 /etc/cron.daily
-    chmod 0700 /etc/cron.hourly
-    chmod 0700 /etc/cron.monthly
-    chmod 0700 /etc/cron.weekly
-    chmod 700 /etc/audit
-    chmod 700 /etc/audit/plugins.d
-    chmod 700 /etc/audit/rules.d
-    chmod 600 /etc/audit/*.conf
-    chmod 600 /etc/audit/*.rules
-    chmod 600 /etc/audit/rules.d/*.rules
-    chmod 700 /sbin/auditctl
-    chmod 700 /sbin/aureport
-    chmod 700 /sbin/ausearch
-    chmod 700 /sbin/autrace
-    chmod 700 /sbin/auditd
-    chmod 700 /sbin/augenrules
-    chmod 600 /etc/security/opasswd
-    chown root:root /etc/security/opasswd
-    
+    safe_chmod 0600 /etc/ssh/sshd_config
+    safe_chmod 0600 /etc/shadow
+    safe_chmod 0600 /etc/gshadow
+    safe_chmod 0644 /etc/passwd
+    safe_chmod 0644 /etc/group
+    safe_chmod 0600 /etc/crontab
+    safe_chmod 0700 /etc/cron.d
+    safe_chmod 0700 /etc/cron.daily
+    safe_chmod 0700 /etc/cron.hourly
+    safe_chmod 0700 /etc/cron.monthly
+    safe_chmod 0700 /etc/cron.weekly
+    safe_chmod 700  /etc/audit
+    safe_chmod 700  /etc/audit/plugins.d
+    safe_chmod 700  /etc/audit/rules.d
+    safe_chmod 600  /etc/audit/*.conf
+    safe_chmod 600  /etc/audit/*.rules
+    safe_chmod 600  /etc/audit/rules.d/*.rules
+    safe_chmod 700  /sbin/auditctl
+    safe_chmod 700  /sbin/aureport
+    safe_chmod 700  /sbin/ausearch
+    safe_chmod 700  /sbin/autrace
+    safe_chmod 700  /sbin/auditd
+    safe_chmod 700  /sbin/augenrules
+    safe_chmod 600  /etc/security/opasswd
+    if [ -f /etc/security/opasswd ]; then
+        chown root:root /etc/security/opasswd
+    fi
 }
 
 
