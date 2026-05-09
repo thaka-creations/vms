@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # Rancher + Kubernetes (k3s) Single-VM Setup
-# Installs k3s, Helm, nginx ingress, cert-manager, and Rancher.
-# Creates prod and sandbox namespaces on the same cluster.
+# Installs k3s, Helm, Cilium CNI, nginx ingress, cert-manager, and Rancher.
+# Creates prod and sandbox namespaces with quotas and network isolation.
 # Run on Ubuntu 22.04+ as root.
 
-set -e
+set -euo pipefail
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -18,6 +18,14 @@ success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 error()   { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 
+# Pinned versions — update deliberately, not automatically
+RANCHER_VERSION="2.8.4"
+CERT_MANAGER_VERSION="v1.14.4"
+INGRESS_NGINX_VERSION="4.10.1"
+
+# ------------------------------
+# Must run as root first
+# ------------------------------
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         error "Run as root: sudo bash rancher_setup.sh"
@@ -25,9 +33,43 @@ check_root() {
     fi
 }
 
-read -p "Enter your Rancher domain (e.g. rancher.yourdomain.com): " RANCHER_HOSTNAME
-read -p "Enter your email for Let's Encrypt certs: " ACME_EMAIL
-RANCHER_VERSION="2.8.4"
+check_root
+
+# Collect inputs after root check
+read -rp "Enter your Rancher domain (e.g. rancher.yourdomain.com): " RANCHER_HOSTNAME
+read -rp "Enter your email for Let's Encrypt certs: " ACME_EMAIL
+
+# Generate a random bootstrap password — never use a hardcoded default
+BOOTSTRAP_PASSWORD=$(openssl rand -base64 24)
+
+# Detect architecture
+ARCH=$(uname -m)
+case "$ARCH" in
+    x86_64)  ARCH_CILIUM="amd64" ;;
+    aarch64) ARCH_CILIUM="arm64" ;;
+    *)       error "Unsupported architecture: $ARCH"; exit 1 ;;
+esac
+
+# ------------------------------
+# Persist KUBECONFIG for the invoking user (not just root)
+# ------------------------------
+REAL_USER="${SUDO_USER:-root}"
+REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+KUBECONFIG_PATH="$REAL_HOME/.kube/config"
+
+setup_kubeconfig() {
+    mkdir -p "$REAL_HOME/.kube"
+    cp /etc/rancher/k3s/k3s.yaml "$KUBECONFIG_PATH"
+    chmod 600 "$KUBECONFIG_PATH"
+    chown "$REAL_USER:$REAL_USER" "$KUBECONFIG_PATH"
+    export KUBECONFIG="$KUBECONFIG_PATH"
+
+    # Persist to shell profile so it survives session
+    PROFILE="$REAL_HOME/.bashrc"
+    if ! grep -q "KUBECONFIG" "$PROFILE"; then
+        echo "export KUBECONFIG=$KUBECONFIG_PATH" >> "$PROFILE"
+    fi
+}
 
 # ------------------------------
 # Open required ports
@@ -41,56 +83,19 @@ open_ports() {
 }
 
 # ------------------------------
-# Install k3s with Flannel and default CNI disabled
-# Required so Cilium can manage all networking via eBPF
+# Install k3s with Flannel disabled
+# Flannel must be off so Cilium owns all pod networking
 # ------------------------------
 install_k3s() {
     if command -v k3s &>/dev/null; then
         log "k3s already installed, skipping."
     else
-        log "Installing k3s (Kubernetes) without Flannel..."
-        curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="
-            --disable traefik
-            --disable-network-policy
-            --flannel-backend=none
-        " sh -
+        log "Installing k3s without Flannel..."
+        curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable traefik --disable-network-policy --flannel-backend=none" sh -
     fi
 
-    mkdir -p ~/.kube
-    cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
-    chmod 600 ~/.kube/config
-    export KUBECONFIG=~/.kube/config
-
-    # Node stays NotReady until Cilium is installed — that is expected
-    log "k3s installed (node will be NotReady until Cilium is up)"
-}
-
-# ------------------------------
-# Install Cilium CNI
-# eBPF-based networking with network policy and Hubble observability
-# ------------------------------
-install_cilium() {
-    log "Installing Cilium..."
-
-    # Install Cilium CLI
-    CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
-    curl -sfL --remote-name-all \
-        "https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-amd64.tar.gz"
-    tar -xzf cilium-linux-amd64.tar.gz -C /usr/local/bin
-    rm cilium-linux-amd64.tar.gz
-
-    # Install Cilium into the cluster
-    cilium install \
-        --set kubeProxyReplacement=true \
-        --set hubble.relay.enabled=true \
-        --set hubble.ui.enabled=true
-
-    log "Waiting for Cilium to be ready..."
-    cilium status --wait
-
-    log "Waiting for node to be Ready..."
-    until kubectl get nodes | grep -q " Ready"; do sleep 3; done
-    success "Cilium ready — $(cilium version --client 2>/dev/null | head -1)"
+    setup_kubeconfig
+    log "k3s installed (node NotReady until Cilium is up — expected)"
 }
 
 # ------------------------------
@@ -107,31 +112,70 @@ install_helm() {
 }
 
 # ------------------------------
-# Install nginx ingress
+# Install Cilium CNI with checksum verification
+# ------------------------------
+install_cilium() {
+    if command -v cilium &>/dev/null && cilium status &>/dev/null 2>&1; then
+        log "Cilium already running, skipping."
+        return
+    fi
+
+    log "Downloading Cilium CLI..."
+    CILIUM_CLI_VERSION=$(curl -fsSL https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
+    CILIUM_TAR="cilium-linux-${ARCH_CILIUM}.tar.gz"
+
+    curl -fsSL -o "$CILIUM_TAR" \
+        "https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/${CILIUM_TAR}"
+    curl -fsSL -o "${CILIUM_TAR}.sha256sum" \
+        "https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/${CILIUM_TAR}.sha256sum"
+
+    sha256sum --check "${CILIUM_TAR}.sha256sum"
+    tar -xzf "$CILIUM_TAR" -C /usr/local/bin
+    rm "$CILIUM_TAR" "${CILIUM_TAR}.sha256sum"
+    success "Cilium CLI checksum verified and installed"
+
+    log "Installing Cilium into cluster..."
+    cilium install \
+        --set kubeProxyReplacement=true \
+        --set hubble.relay.enabled=true \
+        --set hubble.ui.enabled=true
+
+    log "Waiting for Cilium (timeout 5m)..."
+    cilium status --wait --wait-duration=5m
+
+    until kubectl get nodes | grep -q " Ready"; do sleep 3; done
+    success "Cilium ready — $(cilium version --client 2>/dev/null | head -1)"
+}
+
+# ------------------------------
+# Install nginx ingress (pinned version)
 # ------------------------------
 install_nginx_ingress() {
-    log "Installing nginx ingress controller..."
+    log "Installing nginx ingress controller $INGRESS_NGINX_VERSION..."
     helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx --force-update
     helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
         --namespace ingress-nginx \
         --create-namespace \
-        --set controller.service.type=LoadBalancer
-    kubectl rollout status deployment/ingress-nginx-controller -n ingress-nginx --timeout=120s
+        --version "$INGRESS_NGINX_VERSION" \
+        --set controller.service.type=LoadBalancer \
+        --atomic \
+        --timeout 120s
     success "nginx ingress ready"
 }
 
 # ------------------------------
-# Install cert-manager
+# Install cert-manager (pinned version)
 # ------------------------------
 install_cert_manager() {
-    log "Installing cert-manager..."
-    kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.4/cert-manager.crds.yaml
+    log "Installing cert-manager $CERT_MANAGER_VERSION..."
+    kubectl apply -f "https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.crds.yaml"
     helm repo add jetstack https://charts.jetstack.io --force-update
     helm upgrade --install cert-manager jetstack/cert-manager \
         --namespace cert-manager \
         --create-namespace \
-        --version v1.14.4
-    kubectl rollout status deployment/cert-manager -n cert-manager --timeout=120s
+        --version "$CERT_MANAGER_VERSION" \
+        --atomic \
+        --timeout 120s
     success "cert-manager ready"
 }
 
@@ -146,39 +190,34 @@ install_rancher() {
         --create-namespace \
         --version "$RANCHER_VERSION" \
         --set hostname="$RANCHER_HOSTNAME" \
-        --set bootstrapPassword=admin \
+        --set bootstrapPassword="$BOOTSTRAP_PASSWORD" \
         --set ingress.tls.source=letsEncrypt \
         --set letsEncrypt.email="$ACME_EMAIL" \
-        --set letsEncrypt.ingress.class=nginx
-    log "Waiting for Rancher to roll out (2-3 minutes)..."
-    kubectl rollout status deployment/rancher -n cattle-system --timeout=300s
+        --set letsEncrypt.ingress.class=nginx \
+        --atomic \
+        --timeout 300s
     success "Rancher deployed"
 }
 
 # ------------------------------
-# Create prod and sandbox namespaces
-# In Rancher UI these map to Projects for RBAC and resource quotas
+# Create namespaces with quotas, LimitRanges, and network isolation
+# LimitRange is required — quotas are enforced only on pods that declare
+# requests/limits, so without defaults every unconfigured pod bypasses them
 # ------------------------------
 setup_namespaces() {
     log "Creating prod and sandbox namespaces..."
 
     for NS in prod sandbox; do
-        if kubectl get namespace "$NS" &>/dev/null; then
-            warning "Namespace '$NS' already exists, skipping."
-        else
-            kubectl create namespace "$NS"
-            # Label for Rancher project assignment (assign in UI after login)
-            kubectl label namespace "$NS" environment="$NS"
-            success "Namespace '$NS' created"
-        fi
+        kubectl get namespace "$NS" &>/dev/null || kubectl create namespace "$NS"
+        kubectl label namespace "$NS" environment="$NS" --overwrite
     done
 
-    # Resource quotas — prod gets more, sandbox is capped
-    kubectl apply -f - <<'EOF'
+    kubectl apply -f - <<EOF
+# ── Resource Quotas ────────────────────────────────────────────────────────────
 apiVersion: v1
 kind: ResourceQuota
 metadata:
-  name: prod-quota
+  name: quota
   namespace: prod
 spec:
   hard:
@@ -191,7 +230,7 @@ spec:
 apiVersion: v1
 kind: ResourceQuota
 metadata:
-  name: sandbox-quota
+  name: quota
   namespace: sandbox
 spec:
   hard:
@@ -200,12 +239,111 @@ spec:
     limits.cpu: "2"
     limits.memory: 2Gi
     pods: "20"
+---
+# ── LimitRanges (enforce defaults on pods that omit resource fields) ───────────
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: defaults
+  namespace: prod
+spec:
+  limits:
+  - type: Container
+    default:
+      cpu: 500m
+      memory: 256Mi
+    defaultRequest:
+      cpu: 100m
+      memory: 128Mi
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: defaults
+  namespace: sandbox
+spec:
+  limits:
+  - type: Container
+    default:
+      cpu: 250m
+      memory: 128Mi
+    defaultRequest:
+      cpu: 50m
+      memory: 64Mi
+---
+# ── Network Policies (default deny, then allow intra-namespace only) ──────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: prod
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-namespace
+  namespace: prod
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - podSelector: {}
+  egress:
+  - to:
+    - podSelector: {}
+  - to: []
+    ports:
+    - port: 53
+      protocol: UDP
+    - port: 53
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: sandbox
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-namespace
+  namespace: sandbox
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - podSelector: {}
+  egress:
+  - to:
+    - podSelector: {}
+  - to: []
+    ports:
+    - port: 53
+      protocol: UDP
+    - port: 53
+      protocol: TCP
 EOF
 
-    success "Resource quotas applied (prod: 8cpu/8Gi | sandbox: 2cpu/2Gi)"
+    success "Namespaces, quotas, LimitRanges, and NetworkPolicies applied"
 }
 
-check_root
 open_ports
 install_k3s
 install_helm
@@ -217,16 +355,14 @@ setup_namespaces
 
 echo ""
 success "==========================================================="
-success " Rancher:  https://$RANCHER_HOSTNAME"
-success " Bootstrap password: admin  (change on first login!)"
-success " Namespaces: prod, sandbox"
+success " Rancher:            https://$RANCHER_HOSTNAME"
+success " Bootstrap password: $BOOTSTRAP_PASSWORD"
+success " Namespaces:         prod, sandbox (network-isolated)"
 success "==========================================================="
+warning "Save the bootstrap password above — it will not be shown again."
 echo ""
 log "Next steps:"
-echo "  1. Point DNS for $RANCHER_HOSTNAME → this VM's public IP"
-echo "  2. Login to Rancher and change the admin password"
-echo "  3. In Rancher UI: go to the local cluster → Projects/Namespaces"
-echo "     and assign 'prod' and 'sandbox' namespaces to separate Projects"
-echo "  4. Deploy workloads:"
-echo "     kubectl apply -f your-app.yaml -n prod"
-echo "     kubectl apply -f your-app.yaml -n sandbox"
+echo "  1. Point DNS: $RANCHER_HOSTNAME → this VM's public IP"
+echo "  2. Login to Rancher and set your permanent admin password"
+echo "  3. Cluster → Projects/Namespaces → assign prod and sandbox to separate Projects"
+echo "  4. source ~/.bashrc   (or open a new terminal) to pick up KUBECONFIG"
