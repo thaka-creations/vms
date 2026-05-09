@@ -215,6 +215,20 @@ kubectl logs -n cattle-system -l app=rancher --tail=50
 **Pod cannot reach DNS**
 The `allow-intra-namespace` NetworkPolicy allows port 53 egress. If DNS still fails, check that CoreDNS is running: `kubectl get pods -n kube-system -l k8s-app=kube-dns`.
 
+**Pods cannot reach the Kubernetes API (`10.43.0.1:443` i/o timeout)**
+UFW is blocking pod-to-API traffic. The hardening script defaults to deny-all incoming; the k3s pod and service CIDRs must be explicitly whitelisted:
+```bash
+ufw allow from 10.42.0.0/16
+ufw allow from 10.43.0.0/16
+ufw allow to 10.42.0.0/16
+ufw allow to 10.43.0.0/16
+ufw reload
+kubectl rollout restart deployment/local-path-provisioner -n kube-system
+kubectl rollout restart deployment/coredns -n kube-system
+kubectl rollout restart deployment/metrics-server -n kube-system
+kubectl rollout restart deployment/hubble-relay -n kube-system
+```
+
 **Re-running the script**
 All steps are idempotent. k3s, Cilium, and Helm components skip if already present. Helm installs use `upgrade --install` so re-runs are safe.
 

@@ -24,6 +24,31 @@ CERT_MANAGER_VERSION="v1.14.4"
 INGRESS_NGINX_VERSION="4.10.1"
 
 # ------------------------------
+# Wait for kube-apiserver to accept connections
+# ------------------------------
+wait_for_api() {
+    log "Waiting for Kubernetes API server..."
+    local i=0
+    until kubectl cluster-info &>/dev/null; do
+        ((i++))
+        if [[ $i -gt 30 ]]; then
+            error "API server not ready after 60s — check: journalctl -u k3s -n 50"
+            exit 1
+        fi
+        sleep 2
+    done
+}
+
+# ------------------------------
+# Wait for CoreDNS before installing anything that needs DNS
+# ------------------------------
+wait_for_coredns() {
+    log "Waiting for CoreDNS to be ready..."
+    kubectl rollout status deployment/coredns -n kube-system --timeout=120s
+    success "CoreDNS ready"
+}
+
+# ------------------------------
 # Must run as root first
 # ------------------------------
 check_root() {
@@ -75,11 +100,19 @@ setup_kubeconfig() {
 # Open required ports
 # ------------------------------
 open_ports() {
-    log "Opening ports 80 and 443 in UFW..."
+    log "Opening required ports in UFW..."
     ufw allow 80/tcp
     ufw allow 443/tcp
+    ufw allow 6443/tcp   # Kubernetes API (kubectl from outside the VM)
+    ufw allow 10250/tcp  # kubelet API (metrics-server scrapes this)
+    # k3s pod CIDR (10.42.0.0/16) and service CIDR (10.43.0.0/16) must be
+    # whitelisted so pods can reach the Kubernetes API server and each other
+    ufw allow from 10.42.0.0/16
+    ufw allow from 10.43.0.0/16
+    ufw allow to 10.42.0.0/16
+    ufw allow to 10.43.0.0/16
     ufw reload
-    success "Ports opened"
+    success "Ports and k3s CIDRs opened"
 }
 
 # ------------------------------
@@ -88,14 +121,30 @@ open_ports() {
 # ------------------------------
 install_k3s() {
     if command -v k3s &>/dev/null; then
-        log "k3s already installed, skipping."
+        log "k3s already installed — verifying configuration..."
+        # --disable-kube-proxy is required: Cilium takes over kube-proxy duties.
+        # Without it, k3s's built-in proxy and Cilium's eBPF conflict, causing
+        # i/o timeouts on 10.43.0.1:443 for every pod that calls the API server.
+        local has_flag=false
+        grep -q "disable-kube-proxy" /etc/systemd/system/k3s.service 2>/dev/null && has_flag=true
+        grep -q "disable-kube-proxy" /etc/rancher/k3s/config.yaml 2>/dev/null && has_flag=true
+        if [[ "$has_flag" == false ]]; then
+            warning "k3s running without --disable-kube-proxy — patching and restarting..."
+            mkdir -p /etc/rancher/k3s
+            echo "disable-kube-proxy: true" >> /etc/rancher/k3s/config.yaml
+            systemctl restart k3s
+        fi
     else
-        log "Installing k3s without Flannel..."
-        curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable traefik --disable-network-policy --flannel-backend=none" sh -
+        log "Installing k3s..."
+        # --disable-kube-proxy: Cilium takes over kube-proxy duties (kubeProxyReplacement=true).
+        # Without this, k3s's built-in proxy and Cilium's eBPF programs conflict,
+        # causing i/o timeouts on 10.43.0.1:443 for every pod that calls the API.
+        curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable traefik --disable-network-policy --disable-kube-proxy --flannel-backend=none --write-kubeconfig-mode=644" sh -
     fi
 
     setup_kubeconfig
-    log "k3s installed (node NotReady until Cilium is up — expected)"
+    wait_for_api
+    log "k3s ready (node NotReady until Cilium is up — expected)"
 }
 
 # ------------------------------
@@ -112,15 +161,15 @@ install_helm() {
 }
 
 # ------------------------------
-# Install Cilium CNI with checksum verification
+# Install Cilium CLI binary (idempotent)
 # ------------------------------
-install_cilium() {
-    if command -v cilium &>/dev/null && cilium status &>/dev/null 2>&1; then
-        log "Cilium already running, skipping."
+install_cilium_cli() {
+    if command -v cilium &>/dev/null; then
+        log "Cilium CLI already installed ($(cilium version --client 2>/dev/null | head -1)), skipping."
         return
     fi
-
     log "Downloading Cilium CLI..."
+    local CILIUM_CLI_VERSION CILIUM_TAR
     CILIUM_CLI_VERSION=$(curl -fsSL https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
     CILIUM_TAR="cilium-linux-${ARCH_CILIUM}.tar.gz"
 
@@ -133,14 +182,50 @@ install_cilium() {
     tar -xzf "$CILIUM_TAR" -C /usr/local/bin
     rm "$CILIUM_TAR" "${CILIUM_TAR}.sha256sum"
     success "Cilium CLI checksum verified and installed"
+}
 
-    log "Installing Cilium into cluster..."
+# ------------------------------
+# Install Cilium CNI into the cluster
+# ------------------------------
+install_cilium() {
+    install_cilium_cli
+
+    # Health check via Helm (more reliable than parsing cilium status output,
+    # which returns non-zero when agents can't reach the API — a chicken-and-egg
+    # situation on a broken cluster that would confuse the reinstall guard).
+    if helm status cilium -n kube-system &>/dev/null; then
+        local ready
+        ready=$(kubectl get pods -n kube-system -l k8s-app=cilium --no-headers 2>/dev/null \
+            | grep -c "1/1 *Running" || true)
+        if [[ "${ready:-0}" -gt 0 ]]; then
+            log "Cilium already running and healthy, skipping."
+            return
+        fi
+        warning "Cilium helm release exists but pods are unhealthy — reinstalling..."
+        # cilium uninstall removes eBPF programs; helm uninstall alone does not.
+        cilium uninstall --wait 2>/dev/null \
+            || helm uninstall cilium -n kube-system --wait 2>/dev/null \
+            || true
+        kubectl delete namespace cilium-secrets --force --grace-period=0 2>/dev/null || true
+        sleep 5
+    fi
+
+    # Pass the actual node IP so Cilium can reach the API server during bootstrap.
+    # Without this, kube-proxy replacement can't redirect ClusterIP (10.43.0.1:443)
+    # because Cilium doesn't know the real API server address.
+    local NODE_IP
+    NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+
+    log "Installing Cilium into cluster (API server: ${NODE_IP}:6443)..."
     cilium install \
+        --set k8sServiceHost="${NODE_IP}" \
+        --set k8sServicePort=6443 \
         --set kubeProxyReplacement=true \
+        --set hubble.enabled=true \
         --set hubble.relay.enabled=true \
         --set hubble.ui.enabled=true
 
-    log "Waiting for Cilium (timeout 5m)..."
+    log "Waiting for Cilium to be ready (timeout 5m)..."
     cilium status --wait --wait-duration=5m
 
     until kubectl get nodes | grep -q " Ready"; do sleep 3; done
@@ -159,7 +244,7 @@ install_nginx_ingress() {
         --version "$INGRESS_NGINX_VERSION" \
         --set controller.service.type=LoadBalancer \
         --atomic \
-        --timeout 120s
+        --timeout 300s
     success "nginx ingress ready"
 }
 
@@ -348,6 +433,7 @@ open_ports
 install_k3s
 install_helm
 install_cilium
+wait_for_coredns
 install_nginx_ingress
 install_cert_manager
 install_rancher
