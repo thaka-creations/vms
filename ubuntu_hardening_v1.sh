@@ -81,22 +81,13 @@ SSH_PORT=${SSH_PORT:-2004}
 
 echo "🔐 Configuring SSH settings..."
 
-# Verify the current user has an authorized key before disabling password auth
-CURRENT_USER="${SUDO_USER:-$USER}"
-AUTH_KEYS="/home/$CURRENT_USER/.ssh/authorized_keys"
-if [ ! -s "$AUTH_KEYS" ] && [ ! -s "/root/.ssh/authorized_keys" ]; then
-  echo "⚠️  WARNING: No SSH authorized_keys found for '$CURRENT_USER'."
-  echo "    Disabling password auth will lock you out unless you add a key first."
-  read -p "    Continue anyway? [y/N]: " CONFIRM
-  [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborted. Add your public key to $AUTH_KEYS first."; exit 1; }
-fi
-
 sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak || true
 
 # Create SSH config
-sudo tee /etc/ssh/sshd_config > /dev/null << EOF
-Include /etc/ssh/sshd_config.d/*.conf
+# password auth temporarity enabled
+cat << EOF > /etc/ssh/sshd_config
 Port $SSH_PORT
+Include /etc/ssh/sshd_config.d/*.conf
 AddressFamily inet
 ListenAddress 0.0.0.0
 
@@ -150,29 +141,10 @@ RhostsRSAAuthentication no
 Subsystem sftp	/usr/lib/openssh/sftp-server
 EOF
 
-# Validate config before restarting
-echo "🔍 Validating SSH config..."
-if ! sudo sshd -t; then
-  echo "❌ sshd_config is invalid. Restoring backup..."
-  sudo cp /etc/ssh/sshd_config.bak /etc/ssh/sshd_config
-  exit 1
-fi
+# Restart SSH with correct service name
 
 echo "🔁 Restarting SSH service..."
 sudo systemctl restart ssh
-
-# Confirm port is active
-sleep 2
-ACTIVE_PORT=$(sudo ss -tlnp | grep sshd | awk '{print $4}' | cut -d: -f2 | head -1)
-if [ "$ACTIVE_PORT" = "$SSH_PORT" ]; then
-  echo "✅ SSH listening on port $SSH_PORT."
-else
-  echo "⚠️  SSH is on port $ACTIVE_PORT, expected $SSH_PORT — check /etc/ssh/sshd_config"
-fi
-
-# Ensure UFW allows the new port
-sudo ufw allow "$SSH_PORT/tcp"
-sudo ufw reload
 echo "✅ SSH configuration applied and service restarted."
 
 
@@ -348,7 +320,7 @@ echo "🚫 Disabling core dumps..."
 LIMITS_CONF="/etc/security/limits.conf"
 echo "configuring resource limits"
 sudo cp /etc/security/limits.conf /etc/security/limits.conf.bak || true
-sudo tee "$LIMITS_CONF" > /dev/null << 'EOF'
+cat << 'EOF' > "$LIMITS_CONF" 
 * soft core 0
 * hard core 0
 EOF
@@ -371,10 +343,6 @@ echo "✅ AppArmor enabled and profiles enforced."
 # ------------------------------
 echo "⏰ Setting timezone to East Africa Time (EAT) and enabling time synchronization..."
 sudo timedatectl set-timezone Africa/Nairobi
-# Install timesyncd if not present (some Ubuntu installs use chrony instead)
-if ! systemctl list-unit-files | grep -q "^systemd-timesyncd"; then
-  sudo apt install -y systemd-timesyncd
-fi
 sudo systemctl enable systemd-timesyncd
 sudo systemctl start systemd-timesyncd
 sudo timedatectl set-ntp true

@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Rancher + Kubernetes (k3s) Single-VM Setup
-# Installs k3s, Helm, Cilium CNI, nginx ingress, cert-manager, and Rancher.
+# Rancher + Kubernetes (RKE2) Single-VM Setup
+# Installs RKE2, Helm, Cilium CNI, nginx ingress, cert-manager, and Rancher.
 # Creates prod and sandbox namespaces with quotas and network isolation.
 # Run on Ubuntu 22.04+ as root.
 
@@ -19,9 +19,13 @@ error()   { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 
 # Pinned versions — update deliberately, not automatically
-RANCHER_VERSION="2.8.4"
-CERT_MANAGER_VERSION="v1.14.4"
-INGRESS_NGINX_VERSION="4.10.1"
+RANCHER_VERSION="2.14.1"
+CERT_MANAGER_VERSION="v1.20.2"
+INGRESS_NGINX_VERSION="4.15.1"
+
+RKE2_CONFIG_DIR="/etc/rancher/rke2"
+RKE2_KUBECONFIG="/etc/rancher/rke2/rke2.yaml"
+RKE2_BIN="/var/lib/rancher/rke2/bin"
 
 # ------------------------------
 # Wait for kube-apiserver to accept connections
@@ -32,7 +36,7 @@ wait_for_api() {
     until kubectl cluster-info &>/dev/null; do
         ((i++))
         if [[ $i -gt 30 ]]; then
-            error "API server not ready after 60s — check: journalctl -u k3s -n 50"
+            error "API server not ready after 60s — check: journalctl -u rke2-server -n 50"
             exit 1
         fi
         sleep 2
@@ -44,7 +48,16 @@ wait_for_api() {
 # ------------------------------
 wait_for_coredns() {
     log "Waiting for CoreDNS to be ready..."
-    kubectl rollout status deployment/coredns -n kube-system --timeout=120s
+    local i=0
+    until kubectl get pods -n kube-system -l k8s-app=kube-dns --no-headers 2>/dev/null \
+            | grep -q "1/1.*Running"; do
+        ((i++))
+        if [[ $i -gt 24 ]]; then
+            error "CoreDNS not ready after 2m — check: kubectl describe pods -n kube-system -l k8s-app=kube-dns"
+            exit 1
+        fi
+        sleep 5
+    done
     success "CoreDNS ready"
 }
 
@@ -84,15 +97,17 @@ KUBECONFIG_PATH="$REAL_HOME/.kube/config"
 
 setup_kubeconfig() {
     mkdir -p "$REAL_HOME/.kube"
-    cp /etc/rancher/k3s/k3s.yaml "$KUBECONFIG_PATH"
+    cp "$RKE2_KUBECONFIG" "$KUBECONFIG_PATH"
     chmod 600 "$KUBECONFIG_PATH"
     chown "$REAL_USER:$REAL_USER" "$KUBECONFIG_PATH"
     export KUBECONFIG="$KUBECONFIG_PATH"
 
-    # Persist to shell profile so it survives session
-    PROFILE="$REAL_HOME/.bashrc"
+    local PROFILE="$REAL_HOME/.bashrc"
     if ! grep -q "KUBECONFIG" "$PROFILE"; then
         echo "export KUBECONFIG=$KUBECONFIG_PATH" >> "$PROFILE"
+    fi
+    if ! grep -q "$RKE2_BIN" "$PROFILE"; then
+        echo "export PATH=\"$RKE2_BIN:\$PATH\"" >> "$PROFILE"
     fi
 }
 
@@ -101,50 +116,74 @@ setup_kubeconfig() {
 # ------------------------------
 open_ports() {
     log "Opening required ports in UFW..."
+
+    # Detect the active SSH port so UFW never locks us out.
+    # Reads from sshd -T (runtime config) which reflects what sshd is
+    # actually using, regardless of which config file set it.
+    local SSH_PORT
+    SSH_PORT=$(sshd -T 2>/dev/null | awk '/^port /{print $2}' | head -1)
+    SSH_PORT=${SSH_PORT:-22}
+    log "SSH port detected as $SSH_PORT — keeping it open"
+    ufw allow "${SSH_PORT}/tcp"
+
     ufw allow 80/tcp
     ufw allow 443/tcp
-    ufw allow 6443/tcp   # Kubernetes API (kubectl from outside the VM)
-    ufw allow 10250/tcp  # kubelet API (metrics-server scrapes this)
-    # k3s pod CIDR (10.42.0.0/16) and service CIDR (10.43.0.0/16) must be
-    # whitelisted so pods can reach the Kubernetes API server and each other
+    ufw allow 6443/tcp   # Kubernetes API
+    ufw allow 9345/tcp   # RKE2 supervisor API (needed when adding agent nodes)
+    ufw allow 10250/tcp  # kubelet API (metrics-server)
+    # RKE2 pod CIDR (10.42.0.0/16) and service CIDR (10.43.0.0/16)
     ufw allow from 10.42.0.0/16
     ufw allow from 10.43.0.0/16
     ufw allow to 10.42.0.0/16
     ufw allow to 10.43.0.0/16
+    ufw --force enable
     ufw reload
-    success "Ports and k3s CIDRs opened"
+    success "Ports and RKE2 CIDRs opened (SSH on ${SSH_PORT})"
 }
 
 # ------------------------------
-# Install k3s with Flannel disabled
-# Flannel must be off so Cilium owns all pod networking
+# Install RKE2 server
+# cni: none        — Cilium owns all pod networking
+# disable-kube-proxy — Cilium takes over via eBPF (kubeProxyReplacement=true);
+#                      both running causes ClusterIP i/o timeouts
+# disable rke2-ingress-nginx — we install our own nginx via Helm
 # ------------------------------
-install_k3s() {
-    if command -v k3s &>/dev/null; then
-        log "k3s already installed — verifying configuration..."
-        # --disable-kube-proxy is required: Cilium takes over kube-proxy duties.
-        # Without it, k3s's built-in proxy and Cilium's eBPF conflict, causing
-        # i/o timeouts on 10.43.0.1:443 for every pod that calls the API server.
-        local has_flag=false
-        grep -q "disable-kube-proxy" /etc/systemd/system/k3s.service 2>/dev/null && has_flag=true
-        grep -q "disable-kube-proxy" /etc/rancher/k3s/config.yaml 2>/dev/null && has_flag=true
-        if [[ "$has_flag" == false ]]; then
-            warning "k3s running without --disable-kube-proxy — patching and restarting..."
-            mkdir -p /etc/rancher/k3s
-            echo "disable-kube-proxy: true" >> /etc/rancher/k3s/config.yaml
-            systemctl restart k3s
+install_rke2() {
+    if command -v rke2 &>/dev/null; then
+        log "RKE2 already installed — verifying configuration..."
+        local cfg="$RKE2_CONFIG_DIR/config.yaml"
+        local needs_restart=false
+        if ! grep -q "cni: none" "$cfg" 2>/dev/null; then
+            warning "RKE2 config missing 'cni: none' — patching..."
+            echo "cni: none" >> "$cfg"
+            needs_restart=true
         fi
+        if ! grep -q "disable-kube-proxy" "$cfg" 2>/dev/null; then
+            warning "RKE2 config missing 'disable-kube-proxy' — patching..."
+            echo "disable-kube-proxy: true" >> "$cfg"
+            needs_restart=true
+        fi
+        [[ "$needs_restart" == true ]] && systemctl restart rke2-server
     else
-        log "Installing k3s..."
-        # --disable-kube-proxy: Cilium takes over kube-proxy duties (kubeProxyReplacement=true).
-        # Without this, k3s's built-in proxy and Cilium's eBPF programs conflict,
-        # causing i/o timeouts on 10.43.0.1:443 for every pod that calls the API.
-        curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable traefik --disable-network-policy --disable-kube-proxy --flannel-backend=none --write-kubeconfig-mode=644" sh -
+        log "Installing RKE2..."
+        mkdir -p "$RKE2_CONFIG_DIR"
+        cat > "$RKE2_CONFIG_DIR/config.yaml" <<EOF
+cni: none
+disable-kube-proxy: true
+EOF
+        curl -sfL https://get.rke2.io | sh -
+        systemctl enable rke2-server
+        systemctl start rke2-server
     fi
+
+    # Make kubectl available for the rest of this session
+    export PATH="$RKE2_BIN:$PATH"
+    export KUBECONFIG="$RKE2_KUBECONFIG"
+    ln -sf "$RKE2_BIN/kubectl" /usr/local/bin/kubectl 2>/dev/null || true
 
     setup_kubeconfig
     wait_for_api
-    log "k3s ready (node NotReady until Cilium is up — expected)"
+    log "RKE2 ready (node NotReady until Cilium is up — expected)"
 }
 
 # ------------------------------
@@ -213,8 +252,11 @@ install_cilium() {
     # Pass the actual node IP so Cilium can reach the API server during bootstrap.
     # Without this, kube-proxy replacement can't redirect ClusterIP (10.43.0.1:443)
     # because Cilium doesn't know the real API server address.
+    # Filter for IPv4 only — dual-stack nodes expose both IPv4 and IPv6 InternalIPs
+    # and the jsonpath returns them space-separated; passing both is invalid.
     local NODE_IP
-    NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+    NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' \
+        | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
 
     log "Installing Cilium into cluster (API server: ${NODE_IP}:6443)..."
     cilium install \
@@ -430,11 +472,10 @@ EOF
 }
 
 open_ports
-install_k3s
+install_rke2
 install_helm
 install_cilium
 wait_for_coredns
-install_nginx_ingress
 install_cert_manager
 install_rancher
 setup_namespaces

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Full teardown of Rancher + Cilium + k3s
+# Full teardown of Rancher + Cilium + RKE2
 # Run before a fresh rancher_setup.sh install
 # Run on Ubuntu 22.04+ as root
 
@@ -24,37 +24,38 @@ fi
 read -rp "This will destroy the entire cluster. Type 'yes' to confirm: " CONFIRM
 [[ "$CONFIRM" == "yes" ]] || { echo "Aborted."; exit 0; }
 
+# Make RKE2 kubectl available if it exists
+RKE2_BIN="/var/lib/rancher/rke2/bin"
+[[ -d "$RKE2_BIN" ]] && export PATH="$RKE2_BIN:$PATH"
+export KUBECONFIG="/etc/rancher/rke2/rke2.yaml"
+
 # ------------------------------
-# Remove Helm releases
+# Remove Helm releases (while API is still up)
 # ------------------------------
 log "Removing Helm releases..."
-if command -v helm &>/dev/null; then
-    helm uninstall rancher      -n cattle-system    2>/dev/null && log "Rancher removed"       || warning "Rancher not found"
-    helm uninstall cert-manager -n cert-manager     2>/dev/null && log "cert-manager removed"  || warning "cert-manager not found"
-    helm uninstall ingress-nginx -n ingress-nginx   2>/dev/null && log "ingress-nginx removed" || warning "ingress-nginx not found"
-    helm uninstall cilium       -n kube-system      2>/dev/null && log "Cilium helm removed"   || warning "Cilium helm release not found"
+if command -v helm &>/dev/null && kubectl cluster-info &>/dev/null 2>&1; then
+    helm uninstall rancher       -n cattle-system  2>/dev/null && log "Rancher removed"       || warning "Rancher not found"
+    helm uninstall cert-manager  -n cert-manager   2>/dev/null && log "cert-manager removed"  || warning "cert-manager not found"
+    helm uninstall ingress-nginx -n ingress-nginx  2>/dev/null && log "ingress-nginx removed" || warning "ingress-nginx not found"
 fi
 
 # ------------------------------
-# Remove Cilium CRDs and resources
+# Uninstall Cilium cleanly (removes eBPF programs from kernel)
+# Must happen before RKE2 teardown while the API is still up
 # ------------------------------
-log "Removing Cilium resources..."
-kubectl delete daemonset cilium cilium-envoy -n kube-system --ignore-not-found 2>/dev/null || true
-kubectl delete deployment cilium-operator hubble-relay hubble-ui -n kube-system --ignore-not-found 2>/dev/null || true
-kubectl delete clusterrole cilium cilium-operator --ignore-not-found 2>/dev/null || true
-kubectl delete clusterrolebinding cilium cilium-operator --ignore-not-found 2>/dev/null || true
-kubectl delete configmap cilium-config -n kube-system --ignore-not-found 2>/dev/null || true
-kubectl delete secret cilium-ca -n kube-system --ignore-not-found 2>/dev/null || true
-kubectl get crds 2>/dev/null | grep cilium | awk '{print $1}' | xargs kubectl delete crd --ignore-not-found 2>/dev/null || true
+log "Uninstalling Cilium..."
+if command -v cilium &>/dev/null && kubectl cluster-info &>/dev/null 2>&1; then
+    cilium uninstall --wait 2>/dev/null && log "Cilium removed" \
+        || { helm uninstall cilium -n kube-system 2>/dev/null && log "Cilium helm release removed"; } \
+        || warning "Cilium not found"
+fi
 
 # ------------------------------
 # Force-delete stuck namespaces
 # ------------------------------
 log "Removing namespaces..."
-for NS in cilium-secrets cilium-test cilium-test-1 cilium-test-ccnp1 cilium-test-ccnp2 \
-          cattle-system cert-manager ingress-nginx prod sandbox; do
-    if kubectl get namespace "$NS" &>/dev/null; then
-        # Strip finalizers so terminating namespaces don't hang
+for NS in cattle-system cert-manager ingress-nginx cilium-secrets prod sandbox; do
+    if kubectl get namespace "$NS" &>/dev/null 2>&1; then
         kubectl get namespace "$NS" -o json \
             | python3 -c "import sys,json; ns=json.load(sys.stdin); ns['spec']['finalizers']=[]; print(json.dumps(ns))" \
             | kubectl replace --raw "/api/v1/namespaces/$NS/finalize" -f - 2>/dev/null || true
@@ -64,37 +65,47 @@ for NS in cilium-secrets cilium-test cilium-test-1 cilium-test-ccnp1 cilium-test
 done
 
 # ------------------------------
-# Remove cert-manager CRDs
+# Remove cert-manager and Cilium CRDs
 # ------------------------------
-log "Removing cert-manager CRDs..."
-kubectl get crds 2>/dev/null | grep cert-manager | awk '{print $1}' | xargs kubectl delete crd --ignore-not-found 2>/dev/null || true
+log "Removing CRDs..."
+kubectl get crds 2>/dev/null | grep -E "cert-manager|cilium" | awk '{print $1}' \
+    | xargs kubectl delete crd --ignore-not-found 2>/dev/null || true
 
 # ------------------------------
-# Uninstall k3s (removes everything: etcd, kubelet, CNI state)
+# Uninstall RKE2 (removes etcd, kubelet state, CNI config)
+# rke2-uninstall.sh is installed by the RKE2 installer at /usr/local/bin
 # ------------------------------
-log "Uninstalling k3s..."
-if command -v k3s-uninstall.sh &>/dev/null; then
-    k3s-uninstall.sh
-    success "k3s uninstalled"
+log "Uninstalling RKE2..."
+if command -v rke2-uninstall.sh &>/dev/null; then
+    rke2-uninstall.sh
+    success "RKE2 uninstalled"
+elif [[ -f /usr/local/bin/rke2-uninstall.sh ]]; then
+    /usr/local/bin/rke2-uninstall.sh
+    success "RKE2 uninstalled"
 else
-    warning "k3s-uninstall.sh not found — k3s may not be installed"
+    warning "rke2-uninstall.sh not found — RKE2 may not be installed"
 fi
 
 # ------------------------------
-# Clean up leftover files
+# Clean up leftover binaries and config
 # ------------------------------
 log "Cleaning up leftover files..."
-rm -rf ~/.kube
+rm -f /usr/local/bin/kubectl
 rm -f /usr/local/bin/cilium
 rm -f /usr/local/bin/helm
-sed -i '/KUBECONFIG/d' ~/.bashrc 2>/dev/null || true
 
-# Clean up real user's files too
+# Clean up root's kube config and profile entries
+rm -rf /root/.kube
+sed -i '/KUBECONFIG/d' /root/.bashrc 2>/dev/null || true
+sed -i '/rke2\/bin/d' /root/.bashrc 2>/dev/null || true
+
+# Clean up the invoking user's files too
 REAL_USER="${SUDO_USER:-}"
 if [[ -n "$REAL_USER" ]]; then
     REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
     rm -rf "$REAL_HOME/.kube"
     sed -i '/KUBECONFIG/d' "$REAL_HOME/.bashrc" 2>/dev/null || true
+    sed -i '/rke2\/bin/d' "$REAL_HOME/.bashrc" 2>/dev/null || true
 fi
 
 echo ""
