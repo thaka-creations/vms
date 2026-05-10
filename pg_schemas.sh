@@ -36,9 +36,7 @@ warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 read -rp "Target database name: "                      DB_NAME
 read -rp "PostgreSQL port [default: 5433]: "           PG_PORT
 read -rp "Space-separated schema names (e.g. sales inventory finance): " SCHEMAS_INPUT
-read -rp "Admin role that will run migrations [default: ${DB_NAME%_*}_admin]: " MIGRATION_ROLE
 PG_PORT=${PG_PORT:-5433}
-MIGRATION_ROLE=${MIGRATION_ROLE:-"${DB_NAME%_*}_admin"}
 
 [[ "$PG_PORT" =~ ^[0-9]+$ ]] && (( PG_PORT >= 1024 && PG_PORT <= 65535 )) || {
     error "Port must be a number between 1024 and 65535."
@@ -98,10 +96,6 @@ setup_schema() {
     log "Setting up schema: ${SCHEMA}..."
 
     sudo -u postgres psql -v ON_ERROR_STOP=1 -d "${DB_NAME}" <<SQL
--- ── Grant schema login users connect access ───────────────────────────────────
--- pg_setup.sh revokes CONNECT from PUBLIC — grant it explicitly here.
-GRANT CONNECT ON DATABASE ${DB_NAME} TO ${APP_USER}, ${RO_USER};
-
 -- ── Group roles (NOLOGIN) ────────────────────────────────────────────────────
 DO \$\$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${OWNER_ROLE}') THEN
@@ -142,6 +136,9 @@ DO \$\$ BEGIN
     END IF;
 END \$\$;
 
+-- ── Grant connect — must come after roles exist ───────────────────────────────
+GRANT CONNECT ON DATABASE ${DB_NAME} TO ${APP_USER}, ${RO_USER};
+
 -- ── Schema ────────────────────────────────────────────────────────────────────
 CREATE SCHEMA IF NOT EXISTS ${SCHEMA} AUTHORIZATION ${OWNER_ROLE};
 
@@ -149,9 +146,10 @@ CREATE SCHEMA IF NOT EXISTS ${SCHEMA} AUTHORIZATION ${OWNER_ROLE};
 REVOKE ALL ON SCHEMA ${SCHEMA} FROM PUBLIC;
 
 -- ── Privilege grants ──────────────────────────────────────────────────────────
--- USAGE lets a role resolve names inside the schema. Without it, even a SELECT
--- grant on a specific table is useless — the role can't navigate to the table.
 GRANT USAGE ON SCHEMA ${SCHEMA} TO ${RW_ROLE}, ${RO_ROLE};
+
+-- CREATE lets the app user run Django migrations (DDL) against its own schema.
+GRANT CREATE ON SCHEMA ${SCHEMA} TO ${APP_USER};
 
 -- Existing objects
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES    IN SCHEMA ${SCHEMA} TO ${RW_ROLE};
@@ -159,30 +157,21 @@ GRANT USAGE, SELECT                  ON ALL SEQUENCES IN SCHEMA ${SCHEMA} TO ${R
 GRANT SELECT                         ON ALL TABLES    IN SCHEMA ${SCHEMA} TO ${RO_ROLE};
 GRANT SELECT                         ON ALL SEQUENCES IN SCHEMA ${SCHEMA} TO ${RO_ROLE};
 
--- Future objects created BY the migration role.
--- This is the piece most developers get wrong: ALTER DEFAULT PRIVILEGES without
--- FOR ROLE only applies to objects created by whoever runs this script. Since
--- migrations run as ${MIGRATION_ROLE}, we need to specify that explicitly.
-ALTER DEFAULT PRIVILEGES FOR ROLE ${MIGRATION_ROLE} IN SCHEMA ${SCHEMA}
+-- Future objects created BY the app user (migrations run as acl_user, not a
+-- separate admin role). ALTER DEFAULT PRIVILEGES FOR ROLE is required — without
+-- it only objects created in the current session get these defaults.
+ALTER DEFAULT PRIVILEGES FOR ROLE ${APP_USER} IN SCHEMA ${SCHEMA}
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES    TO ${RW_ROLE};
-ALTER DEFAULT PRIVILEGES FOR ROLE ${MIGRATION_ROLE} IN SCHEMA ${SCHEMA}
-    GRANT USAGE, SELECT                  ON SEQUENCES  TO ${RW_ROLE};
-ALTER DEFAULT PRIVILEGES FOR ROLE ${MIGRATION_ROLE} IN SCHEMA ${SCHEMA}
-    GRANT EXECUTE                        ON FUNCTIONS  TO ${RW_ROLE};
-ALTER DEFAULT PRIVILEGES FOR ROLE ${MIGRATION_ROLE} IN SCHEMA ${SCHEMA}
-    GRANT SELECT                         ON TABLES     TO ${RO_ROLE};
-ALTER DEFAULT PRIVILEGES FOR ROLE ${MIGRATION_ROLE} IN SCHEMA ${SCHEMA}
-    GRANT SELECT                         ON SEQUENCES  TO ${RO_ROLE};
-ALTER DEFAULT PRIVILEGES FOR ROLE ${MIGRATION_ROLE} IN SCHEMA ${SCHEMA}
-    GRANT EXECUTE                        ON FUNCTIONS  TO ${RO_ROLE};
-
--- Future objects created BY the owner role (e.g. if seeds run as owner)
-ALTER DEFAULT PRIVILEGES FOR ROLE ${OWNER_ROLE} IN SCHEMA ${SCHEMA}
-    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES    TO ${RW_ROLE};
-ALTER DEFAULT PRIVILEGES FOR ROLE ${OWNER_ROLE} IN SCHEMA ${SCHEMA}
-    GRANT USAGE, SELECT                  ON SEQUENCES  TO ${RW_ROLE};
-ALTER DEFAULT PRIVILEGES FOR ROLE ${OWNER_ROLE} IN SCHEMA ${SCHEMA}
-    GRANT SELECT                         ON TABLES     TO ${RO_ROLE};
+ALTER DEFAULT PRIVILEGES FOR ROLE ${APP_USER} IN SCHEMA ${SCHEMA}
+    GRANT USAGE, SELECT                  ON SEQUENCES TO ${RW_ROLE};
+ALTER DEFAULT PRIVILEGES FOR ROLE ${APP_USER} IN SCHEMA ${SCHEMA}
+    GRANT EXECUTE                        ON FUNCTIONS TO ${RW_ROLE};
+ALTER DEFAULT PRIVILEGES FOR ROLE ${APP_USER} IN SCHEMA ${SCHEMA}
+    GRANT SELECT                         ON TABLES    TO ${RO_ROLE};
+ALTER DEFAULT PRIVILEGES FOR ROLE ${APP_USER} IN SCHEMA ${SCHEMA}
+    GRANT SELECT                         ON SEQUENCES TO ${RO_ROLE};
+ALTER DEFAULT PRIVILEGES FOR ROLE ${APP_USER} IN SCHEMA ${SCHEMA}
+    GRANT EXECUTE                        ON FUNCTIONS TO ${RO_ROLE};
 
 -- ── search_path ───────────────────────────────────────────────────────────────
 -- Pin each login role to its schema so unqualified table names resolve correctly
