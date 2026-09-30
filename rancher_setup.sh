@@ -317,6 +317,23 @@ install_cilium_cli() {
 }
 
 # ------------------------------
+# Pods that got an IP from a previous Cilium pool keep it until recreated.
+# UFW doesn't trust those IPs, so e.g. CoreDNS can't reach the API server.
+# ------------------------------
+recreate_stale_pods() {
+    local pod_prefix="${POD_CIDR%.*.*}."   # 10.42.0.0/16 → "10.42."
+    local stale
+    stale=$(kubectl get pods -A --no-headers \
+        -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,HOST:.spec.hostNetwork,IP:.status.podIP \
+        | awk -v p="$pod_prefix" '$3 != "true" && $4 != "<none>" && index($4, p) != 1 {print $1, $2}')
+    [[ -z "$stale" ]] && return
+    log "Recreating pods with IPs outside $POD_CIDR..."
+    while read -r ns name; do
+        kubectl delete pod -n "$ns" "$name" --wait=false
+    done <<< "$stale"
+}
+
+# ------------------------------
 # Install Cilium CNI into the cluster
 # ------------------------------
 install_cilium() {
@@ -325,7 +342,6 @@ install_cilium() {
     # Health check via Helm (more reliable than parsing cilium status output,
     # which returns non-zero when agents can't reach the API — a chicken-and-egg
     # situation on a broken cluster that would confuse the reinstall guard).
-    local reinstalled=false
     if helm status cilium -n kube-system &>/dev/null; then
         local ready pool_ok=false
         ready=$(kubectl get pods -n kube-system -l k8s-app=cilium --no-headers 2>/dev/null \
@@ -347,6 +363,9 @@ install_cilium() {
                 cilium upgrade --reuse-values --set nodeIPAM.enabled=true
                 cilium status --wait --wait-duration=5m
             fi
+            # A previous run may have fixed the pool but died before the
+            # old pods were recreated.
+            recreate_stale_pods
             log "Cilium already running and healthy, skipping."
             return
         fi
@@ -357,7 +376,6 @@ install_cilium() {
             || true
         kubectl delete namespace cilium-secrets --force --grace-period=0 2>/dev/null || true
         sleep 5
-        reinstalled=true
     fi
 
     # Pass the actual node IP so Cilium can reach the API server during bootstrap.
@@ -382,20 +400,12 @@ install_cilium() {
         --set hubble.relay.enabled=true \
         --set hubble.ui.enabled=true
 
+    # Before the status wait: hubble-relay needs CoreDNS, which may be one
+    # of the stale pods.
+    recreate_stale_pods
+
     log "Waiting for Cilium to be ready (timeout 5m)..."
     cilium status --wait --wait-duration=5m
-
-    # Pods from the previous install keep their old IPs — recreate them so
-    # they get addresses from the new pool.
-    if [[ "$reinstalled" == true ]]; then
-        log "Recreating pods that still hold IPs from the old Cilium pool..."
-        kubectl get pods -A --no-headers \
-            -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,HOST:.spec.hostNetwork \
-            | awk '$3 != "true" {print $1, $2}' \
-            | while read -r ns name; do
-                kubectl delete pod -n "$ns" "$name" --wait=false
-            done
-    fi
 
     until kubectl get nodes | grep -q " Ready"; do sleep 3; done
     success "Cilium ready — $(cilium version --client 2>/dev/null | head -1)"
