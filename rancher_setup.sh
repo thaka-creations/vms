@@ -36,6 +36,11 @@ RKE2_CHANNEL="v1.35"
 GATEWAY_NS="envoy-gateway-system"
 GATEWAY_NAME="public"
 
+# RKE2 defaults. Cilium's pod pool is pinned to POD_CIDR and UFW trusts both
+# ranges — keep them in sync or pod→node traffic (API, DNS) gets dropped.
+POD_CIDR="10.42.0.0/16"
+SERVICE_CIDR="10.43.0.0/16"
+
 BOOTSTRAP_FILE="/root/.rancher_bootstrap_password"
 
 RKE2_CONFIG_DIR="/etc/rancher/rke2"
@@ -176,10 +181,10 @@ open_ports() {
     # When adding agent nodes later, allow 9345/6443 from each node's IP only:
     #   ufw allow from <node-ip> to any port 9345,6443 proto tcp
     # RKE2 pod CIDR (10.42.0.0/16) and service CIDR (10.43.0.0/16)
-    ufw allow from 10.42.0.0/16
-    ufw allow from 10.43.0.0/16
-    ufw allow to 10.42.0.0/16
-    ufw allow to 10.43.0.0/16
+    ufw allow from "$POD_CIDR"
+    ufw allow from "$SERVICE_CIDR"
+    ufw allow to "$POD_CIDR"
+    ufw allow to "$SERVICE_CIDR"
     ufw --force enable
     ufw reload
     success "Ports and RKE2 CIDRs opened (SSH on ${SSH_PORT})"
@@ -320,10 +325,19 @@ install_cilium() {
     # Health check via Helm (more reliable than parsing cilium status output,
     # which returns non-zero when agents can't reach the API — a chicken-and-egg
     # situation on a broken cluster that would confuse the reinstall guard).
+    local reinstalled=false
     if helm status cilium -n kube-system &>/dev/null; then
-        local ready
+        local ready pool_ok=false
         ready=$(kubectl get pods -n kube-system -l k8s-app=cilium --no-headers 2>/dev/null \
             | grep -c "1/1 *Running" || true)
+        # Pods must get IPs from POD_CIDR — UFW only trusts that range, so
+        # Cilium's default pool (10.0.0.0/8) gets pod→node traffic dropped.
+        helm get values cilium -n kube-system --all 2>/dev/null \
+            | grep -qF "$POD_CIDR" && pool_ok=true
+        if [[ "$pool_ok" != true ]]; then
+            warning "Cilium pod CIDR is not $POD_CIDR — reinstalling..."
+            ready=0
+        fi
         if [[ "${ready:-0}" -gt 0 ]]; then
             # Existing clusters predate the Envoy Gateway setup — make sure
             # node IPAM (LoadBalancer on the node IP) is on.
@@ -343,6 +357,7 @@ install_cilium() {
             || true
         kubectl delete namespace cilium-secrets --force --grace-period=0 2>/dev/null || true
         sleep 5
+        reinstalled=true
     fi
 
     # Pass the actual node IP so Cilium can reach the API server during bootstrap.
@@ -360,12 +375,27 @@ install_cilium() {
         --set k8sServicePort=6443 \
         --set kubeProxyReplacement=true \
         --set nodeIPAM.enabled=true \
+        --set ipam.mode=cluster-pool \
+        --set ipam.operator.clusterPoolIPv4PodCIDRList="${POD_CIDR}" \
+        --set ipam.operator.clusterPoolIPv4MaskSize=24 \
         --set hubble.enabled=true \
         --set hubble.relay.enabled=true \
         --set hubble.ui.enabled=true
 
     log "Waiting for Cilium to be ready (timeout 5m)..."
     cilium status --wait --wait-duration=5m
+
+    # Pods from the previous install keep their old IPs — recreate them so
+    # they get addresses from the new pool.
+    if [[ "$reinstalled" == true ]]; then
+        log "Recreating pods that still hold IPs from the old Cilium pool..."
+        kubectl get pods -A --no-headers \
+            -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,HOST:.spec.hostNetwork \
+            | awk '$3 != "true" {print $1, $2}' \
+            | while read -r ns name; do
+                kubectl delete pod -n "$ns" "$name" --wait=false
+            done
+    fi
 
     until kubectl get nodes | grep -q " Ready"; do sleep 3; done
     success "Cilium ready — $(cilium version --client 2>/dev/null | head -1)"
