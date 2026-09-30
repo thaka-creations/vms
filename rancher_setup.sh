@@ -630,13 +630,22 @@ install_cert_manager() {
     log "Installing cert-manager $CERT_MANAGER_VERSION..."
     kubectl apply -f "https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.crds.yaml"
     helm repo add jetstack https://charts.jetstack.io --force-update
-    helm upgrade --install cert-manager jetstack/cert-manager \
+    # No --atomic: its rollback deletes the pods and events that explain a
+    # failure. First install pulls four images plus the startupapicheck hook,
+    # which can outlast a short timeout on a fresh node.
+    if ! helm upgrade --install cert-manager jetstack/cert-manager \
         --namespace cert-manager \
         --create-namespace \
         --version "$CERT_MANAGER_VERSION" \
         --set config.gatewayAPI.enabled=true \
-        --atomic \
-        --timeout 120s
+        --wait --wait-for-jobs \
+        --timeout 5m; then
+        error "cert-manager install failed — current state:"
+        kubectl get pods,jobs -n cert-manager -o wide || true
+        kubectl get events -n cert-manager --sort-by=.lastTimestamp | tail -20 || true
+        kubectl logs -n cert-manager -l app.kubernetes.io/component=startupapicheck --tail=20 2>/dev/null || true
+        exit 1
+    fi
     # Gateway API support is detected only at startup — restart in case the
     # release already existed from before the CRDs were installed.
     kubectl rollout restart deployment cert-manager -n cert-manager
