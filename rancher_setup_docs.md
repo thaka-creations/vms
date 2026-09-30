@@ -110,7 +110,7 @@ On an existing healthy install, it only turns on node IPAM if it's missing.
 - **`GatewayClass` `envoy`**: points at that `EnvoyProxy`.
 
 ### 6. `install_cert_manager`
-Installs cert-manager with `config.gatewayAPI.enabled=true`. It's installed after the Gateway API CRDs because cert-manager detects them only at startup. It then creates the `ClusterIssuer` `letsencrypt`, which answers HTTP-01 challenges through the Gateway's `http` listener.
+Installs cert-manager with `config.enableGatewayAPI=true`. It's installed after the Gateway API CRDs because cert-manager detects them only at startup. It then creates the `ClusterIssuer` `letsencrypt`, which answers HTTP-01 challenges through the Gateway's `http` listener.
 
 ### 7. `setup_gateway`
 Creates the `Gateway` `public` in `envoy-gateway-system`:
