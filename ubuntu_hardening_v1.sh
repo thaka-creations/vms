@@ -1,6 +1,11 @@
 #!/bin/bash
 
-set -e
+set -euo pipefail
+
+if [[ $EUID -ne 0 ]]; then
+  echo "❌ Run as root: sudo bash ubuntu_hardening_v1.sh" >&2
+  exit 1
+fi
 
 echo "🚀 Starting Ubuntu maintenance script..."
 
@@ -15,7 +20,7 @@ sudo apt autoclean -y
 sudo apt clean
 
 #remove unnecessary packages
-sudo apt purge vsftpd telnet apport inetutils-telnet
+sudo apt purge -y vsftpd telnet apport inetutils-telnet || true
 
 echo "✅ System packages updated."
 
@@ -76,18 +81,30 @@ echo "✅ Firmware update check complete."
 # SSH CONFIGS
 # ------------------------------
 
-read -p "Enter custom SSH port [default: 2004]: " SSH_PORT
+read -rp "Enter custom SSH port [default: 2004]: " SSH_PORT
 SSH_PORT=${SSH_PORT:-2004}
+if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || (( SSH_PORT < 1 || SSH_PORT > 65535 )); then
+  echo "❌ Invalid SSH port: $SSH_PORT" >&2
+  exit 1
+fi
+
+# Password auth is disabled below — refuse to continue unless at least one
+# non-root user has an authorized key, otherwise we lock ourselves out.
+if [[ -z "$(find /home -mindepth 3 -maxdepth 3 -path '*/.ssh/authorized_keys' -size +0 -print -quit 2>/dev/null)" ]]; then
+  echo "❌ No /home/*/.ssh/authorized_keys found. Add your key first (ssh_authorize.sh)." >&2
+  exit 1
+fi
 
 echo "🔐 Configuring SSH settings..."
 
 sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak || true
 
 # Create SSH config
-# password auth temporarity enabled
+# sshd uses the FIRST value it sees for each keyword, so the Include of
+# sshd_config.d goes at the END — otherwise cloud-init's 50-cloud-init.conf
+# (PasswordAuthentication yes) silently overrides the settings below.
 cat << EOF > /etc/ssh/sshd_config
 Port $SSH_PORT
-Include /etc/ssh/sshd_config.d/*.conf
 AddressFamily inet
 ListenAddress 0.0.0.0
 
@@ -96,13 +113,10 @@ HostKey /etc/ssh/ssh_host_rsa_key
 HostKey /etc/ssh/ssh_host_ecdsa_key
 HostKey /etc/ssh/ssh_host_ed25519_key
 
-# SSH Protocol
-Protocol 2
-
 # Ciphers and keying
 Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
-MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256
-KexAlgorithms curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
+KexAlgorithms sntrup761x25519-sha512@openssh.com,curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512
 
 # Logging
 SyslogFacility AUTHPRIV
@@ -110,13 +124,13 @@ LogLevel INFO
 
 # Authentication
 HostbasedAuthentication no
-PasswordAuthentication no  
+PasswordAuthentication no
 PermitRootLogin no
 PermitEmptyPasswords no
 PubkeyAuthentication yes
 AuthorizedKeysFile .ssh/authorized_keys
 AuthenticationMethods publickey
-ChallengeResponseAuthentication no
+KbdInteractiveAuthentication no
 UsePAM yes
 
 # Session settings
@@ -137,13 +151,29 @@ PrintMotd no
 PermitTTY yes
 PermitUserRC no
 IgnoreRhosts yes
-RhostsRSAAuthentication no
 Subsystem sftp	/usr/lib/openssh/sftp-server
+
+Include /etc/ssh/sshd_config.d/*.conf
 EOF
+chmod 600 /etc/ssh/sshd_config
+
+# Validate before restarting — a bad config would leave sshd down.
+if ! sshd -t; then
+  echo "❌ sshd config invalid — restoring backup." >&2
+  cp /etc/ssh/sshd_config.bak /etc/ssh/sshd_config
+  exit 1
+fi
+
+# Open the new SSH port BEFORE restarting sshd on it, so an already-active
+# UFW never cuts us off.
+ufw allow "${SSH_PORT}/tcp" || true
 
 # Restart SSH with correct service name
+# (Ubuntu 22.10+ uses socket activation; restart the socket too if present)
 
 echo "🔁 Restarting SSH service..."
+sudo systemctl daemon-reload
+systemctl is-enabled ssh.socket &>/dev/null && sudo systemctl restart ssh.socket || true
 sudo systemctl restart ssh
 echo "✅ SSH configuration applied and service restarted."
 
@@ -195,7 +225,9 @@ sudo cp /etc/fail2ban/jail.local /etc/fail2ban/jail.local.bak || true
 # Backup existing config if present
 
 echo "Writing new jail.local..."
-cat > "$JAIL_CONF" << 'EOF'
+# port must be the real SSH port — "ssh" means 22, so bans on a custom
+# port would block the wrong port and never take effect.
+cat > "$JAIL_CONF" << EOF
 [DEFAULT]
 bantime  = 1h
 findtime  = 10m
@@ -204,7 +236,7 @@ backend = systemd
 
 [sshd]
 enabled = true
-port    = ssh
+port    = ${SSH_PORT}
 logpath = %(sshd_log)s
 maxretry = 3
 EOF
@@ -221,9 +253,10 @@ echo "fail2ban restarted and enabled"
 echo "🛡️ Enabling UFW firewall..."
 sudo ufw default deny incoming
 sudo ufw default allow outgoing
+# Allow (rate-limited) SSH BEFORE enabling, or the enable drops our session.
+sudo ufw limit "${SSH_PORT}/tcp"
 sudo ufw --force enable
 echo "✅ UFW enabled."
-sudo ufw allow $SSH_PORT
 
 
 # ------------------------------
@@ -274,10 +307,24 @@ net.ipv4.conf.all.log_martians = 1
 net.ipv4.conf.default.log_martians = 1
 net.ipv4.conf.all.secure_redirects = 0
 net.ipv4.conf.default.secure_redirects = 0
-fs.suid_dumpable = 0 
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+fs.suid_dumpable = 0
+
+# Kernel info leaks / local privilege escalation surface
+kernel.kptr_restrict = 2
+kernel.dmesg_restrict = 1
+kernel.yama.ptrace_scope = 1
+kernel.unprivileged_bpf_disabled = 1
+net.core.bpf_jit_harden = 2
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+fs.protected_fifos = 2
+fs.protected_regular = 2
 
 EOF
-sudo sysctl -p
+# Unknown keys on older kernels must not abort the run under set -e
+sudo sysctl -p || true
 
 echo "✅ IPv6 disabled."
 echo "✅ Network hardening applied."
@@ -308,7 +355,16 @@ if ! grep -q "module.sig_enforce=1" /etc/default/grub; then
   sudo sed -i '/^GRUB_CMDLINE_LINUX_DEFAULT/ s/"$/ module.sig_enforce=1"/' /etc/default/grub
   sudo update-grub
 fi
-echo "install module /bin/false" | sudo tee /etc/modprobe.d/disable-modules.conf
+# Block rarely-used filesystems and network protocols (CIS 1.1.1 / 3.4) —
+# historically a common source of kernel privilege-escalation bugs.
+# ("install module /bin/false" blocked a module literally named "module".)
+rm -f /etc/modprobe.d/disable-modules.conf
+{
+  for m in cramfs freevxfs jffs2 hfs hfsplus udf dccp sctp rds tipc; do
+    echo "install $m /bin/false"
+    echo "blacklist $m"
+  done
+} | sudo tee /etc/modprobe.d/cis-disable-modules.conf >/dev/null
 echo "✅ Kernel module loading restricted (reboot needed)."
 
 # ------------------------------
@@ -332,10 +388,12 @@ echo "✅ Core dumps disabled."
 # ------------------------------
 echo "🔐 Enabling and enforcing AppArmor..."
 
-sudo apt install apparmor-utils apparmor-profiles
+sudo apt install -y apparmor-utils apparmor-profiles
 sudo systemctl enable apparmor
 sudo systemctl start apparmor
-sudo aa-enforce /etc/apparmor.d/*
+# Only profile files (not abstractions/, tunables/ …); one bad profile
+# must not abort the rest of the hardening run.
+find /etc/apparmor.d -maxdepth 1 -type f -exec aa-enforce {} + || true
 echo "✅ AppArmor enabled and profiles enforced."
 
 # ------------------------------
@@ -351,17 +409,19 @@ echo "✅ Timezone set to EAT and time synchronization enabled."
 # ------------------------------
 # Disable Bash history for all users
 # ------------------------------
-echo "🚫 Disabling Bash history for all users..."
-# Disable history for current session
-export HISTSIZE=0
-export HISTFILESIZE=0
-unset HISTFILE
-# Disable history permanently for all users by adding to /etc/profile if not already present
-if ! grep -q "HISTSIZE=0" /etc/profile; then
-  echo 'export HISTSIZE=0' | sudo tee -a /etc/profile
-  echo 'export HISTFILESIZE=0' | sudo tee -a /etc/profile
-  echo 'unset HISTFILE' | sudo tee -a /etc/profile
-fi
-echo "✅ Bash history disabled."
+# Disabling history destroys the record of what an intruder (or an admin)
+# ran. Keep it, timestamped; commands typed with a leading space are not
+# recorded, so secrets can be kept out deliberately.
+echo "📝 Configuring timestamped Bash history for all users..."
+sed -i '/^export HISTSIZE=0$/d; /^export HISTFILESIZE=0$/d; /^unset HISTFILE$/d' /etc/profile
+cat > /etc/profile.d/99-history.sh <<'EOF'
+export HISTTIMEFORMAT='%F %T '
+export HISTCONTROL=ignorespace
+export HISTSIZE=10000
+export HISTFILESIZE=10000
+shopt -s histappend
+EOF
+chmod 644 /etc/profile.d/99-history.sh
+echo "✅ Bash history timestamped (prefix a command with a space to keep it out)."
 
 echo "🎉 VM HARDENING complete -REBOOT TO apply changes!"

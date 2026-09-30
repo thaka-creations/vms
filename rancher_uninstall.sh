@@ -93,6 +93,7 @@ log "Cleaning up leftover files..."
 rm -f /usr/local/bin/kubectl
 rm -f /usr/local/bin/cilium
 rm -f /usr/local/bin/helm
+rm -f /root/.rancher_bootstrap_password
 
 # Clean up root's kube config and profile entries
 rm -rf /root/.kube
@@ -103,6 +104,7 @@ sed -i '/rke2\/bin/d' /root/.bashrc 2>/dev/null || true
 REAL_USER="${SUDO_USER:-}"
 if [[ -n "$REAL_USER" ]]; then
     REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+    [[ -n "$REAL_HOME" && "$REAL_HOME" != "/" ]] || { warning "No home for $REAL_USER — skipping"; REAL_HOME=/nonexistent; }
     rm -rf "$REAL_HOME/.kube"
     sed -i '/KUBECONFIG/d' "$REAL_HOME/.bashrc" 2>/dev/null || true
     sed -i '/rke2\/bin/d' "$REAL_HOME/.bashrc" 2>/dev/null || true

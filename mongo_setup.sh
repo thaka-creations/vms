@@ -65,6 +65,75 @@ READONLY_PASSWORD=$(gen_password)
 
 # Derive the major version for the repo key (e.g. "8.0" → "8.0")
 MONGO_MAJOR="${MONGO_VERSION}"
+[[ "$MONGO_MAJOR" =~ ^[0-9]+\.[0-9]+$ ]] || { error "Invalid MongoDB version: $MONGO_MAJOR"; exit 1; }
+
+# ------------------------------
+# Run JS through mongosh without putting credentials on the command line.
+# argv (-p <password>, --eval "...pwd...") is readable by every local user
+# via ps / /proc/<pid>/cmdline, so the script — credentials included — goes
+# into a root-only temp file instead.
+#   mongo_js noauth <port>   — connect without auth (bootstrap only)
+#   mongo_js admin  <port>   — connect and authenticate as the admin user
+# JS body is read from stdin.
+# ------------------------------
+mongo_js() {
+    local mode="$1" port="$2" js rc=0
+    js=$(mktemp)   # mktemp creates the file 0600
+    {
+        echo "db = connect('mongodb://127.0.0.1:${port}/admin');"
+        if [[ "$mode" == "admin" ]]; then
+            echo "db.auth('${ADMIN_USER}', '${ADMIN_PASSWORD}');"
+        fi
+        cat
+    } > "$js"
+    mongosh --quiet --nodb "$js" || rc=$?
+    rm -f "$js"
+    return "$rc"
+}
+
+# ------------------------------
+# Never leave mongod running without auth. prepare_for_bootstrap() starts it
+# with authorization disabled; if anything fails before configure_mongo()
+# re-enables auth, this trap writes the secure config and restarts mongod.
+# ------------------------------
+NOAUTH_ACTIVE=false
+
+write_secure_conf() {
+    local CONF="/etc/mongod.conf"
+    cat > "$CONF" <<EOF
+# mongod.conf — managed by mongo_setup.sh
+
+storage:
+  dbPath: /var/lib/mongodb
+
+systemLog:
+  destination: file
+  logAppend: true
+  path: /var/log/mongodb/mongod.log
+
+net:
+  port: ${MONGO_PORT}
+  bindIp: 127.0.0.1
+
+security:
+  authorization: enabled
+
+operationProfiling:
+  slowOpThresholdMs: 100
+  mode: slowOp
+EOF
+    chown root:mongodb "$CONF"
+    chmod 640 "$CONF"
+}
+
+on_exit() {
+    if [[ "$NOAUTH_ACTIVE" == true ]]; then
+        error "Aborted while mongod was running without auth — re-enabling authorization."
+        write_secure_conf
+        systemctl restart mongod || true
+    fi
+}
+trap on_exit EXIT
 
 # ------------------------------
 # Install MongoDB from official repo
@@ -152,6 +221,7 @@ BASECONF
     chown root:mongodb /etc/mongod.conf
     chmod 640 /etc/mongod.conf
 
+    NOAUTH_ACTIVE=true
     systemctl restart mongod
 
     local attempts=0
@@ -168,7 +238,7 @@ BASECONF
 bootstrap_admin() {
     log "Bootstrapping MongoDB admin user..."
 
-    mongosh --quiet --port 27017 admin --eval "
+    mongo_js noauth 27017 <<JS
         if (db.getUser('${ADMIN_USER}') === null) {
             db.createUser({
                 user: '${ADMIN_USER}',
@@ -184,7 +254,7 @@ bootstrap_admin() {
             db.updateUser('${ADMIN_USER}', { pwd: '${ADMIN_PASSWORD}' });
             print('Admin user password updated.');
         }
-    "
+JS
 
     success "Admin user ready: ${ADMIN_USER}"
 }
@@ -193,43 +263,16 @@ bootstrap_admin() {
 # Harden mongod.conf and enable auth
 # ------------------------------
 configure_mongo() {
-    local CONF="/etc/mongod.conf"
-
     log "Hardening MongoDB configuration..."
 
-    cat > "$CONF" <<EOF
-# mongod.conf — managed by mongo_setup.sh
-
-storage:
-  dbPath: /var/lib/mongodb
-
-systemLog:
-  destination: file
-  logAppend: true
-  path: /var/log/mongodb/mongod.log
-
-net:
-  port: ${MONGO_PORT}
-  bindIp: 127.0.0.1
-
-security:
-  authorization: enabled
-
-operationProfiling:
-  slowOpThresholdMs: 100
-  mode: slowOp
-EOF
-
-    chown root:mongodb "$CONF"
-    chmod 640 "$CONF"
-
+    write_secure_conf
     systemctl restart mongod
+    NOAUTH_ACTIVE=false
 
     # Wait for restart
     local attempts=0
-    until mongosh --quiet --port "${MONGO_PORT}" \
-          -u "${ADMIN_USER}" -p "${ADMIN_PASSWORD}" --authenticationDatabase admin \
-          --eval "db.runCommand({ping:1})" &>/dev/null || (( ++attempts >= 20 )); do
+    until mongo_js admin "${MONGO_PORT}" <<<"db.runCommand({ping:1})" &>/dev/null \
+          || (( ++attempts >= 20 )); do
         sleep 1
     done
     if (( attempts >= 20 )); then
@@ -248,9 +291,7 @@ EOF
 create_users() {
     log "Creating app and readonly users on database '${DB_NAME}'..."
 
-    mongosh --quiet --port "${MONGO_PORT}" \
-        -u "${ADMIN_USER}" -p "${ADMIN_PASSWORD}" --authenticationDatabase admin \
-        admin --eval "
+    mongo_js admin "${MONGO_PORT}" <<JS
         // App user: readWrite on the target database only
         const appDb = db.getSiblingDB('${DB_NAME}');
         if (appDb.getUser('${APP_USER}') === null) {
@@ -277,7 +318,7 @@ create_users() {
             appDb.updateUser('${READONLY_USER}', { pwd: '${READONLY_PASSWORD}' });
             print('Readonly user password updated.');
         }
-    "
+JS
 
     success "Users created on '${DB_NAME}'."
 }
@@ -286,6 +327,8 @@ create_users() {
 # Save credentials to a root-only env file
 # ------------------------------
 save_credentials() {
+    # Root-only from creation — no world-readable window before the chmod.
+    rm -f "$CREDS_FILE"; ( umask 077; : > "$CREDS_FILE" )
     cat > "$CREDS_FILE" <<EOF
 # MongoDB credentials — ${APP_NAME}
 # Generated: $(date -u +"%Y-%m-%dT%H:%M:%SZ")

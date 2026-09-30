@@ -22,6 +22,10 @@ warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 RANCHER_VERSION="2.14.1"
 CERT_MANAGER_VERSION="v1.20.2"
 INGRESS_NGINX_VERSION="4.15.1"
+HELM_VERSION="v3.19.0"
+RKE2_CHANNEL="stable"   # or pin a minor, e.g. "v1.33"
+
+BOOTSTRAP_FILE="/root/.rancher_bootstrap_password"
 
 RKE2_CONFIG_DIR="/etc/rancher/rke2"
 RKE2_KUBECONFIG="/etc/rancher/rke2/rke2.yaml"
@@ -76,6 +80,19 @@ check_root
 # Collect inputs after root check
 read -rp "Enter your Rancher domain (e.g. rancher.yourdomain.com): " RANCHER_HOSTNAME
 read -rp "Enter your email for Let's Encrypt certs: " ACME_EMAIL
+read -rp "Trusted admin CIDR for direct kube-API access (e.g. 203.0.113.4/32, blank = none): " ADMIN_CIDR
+
+# These go into `helm --set`, where a comma or '=' would inject extra chart
+# values — validate strictly.
+[[ "$RANCHER_HOSTNAME" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?[.])+[a-zA-Z]{2,}$ ]] || {
+    error "Invalid hostname: $RANCHER_HOSTNAME"; exit 1; }
+[[ "$ACME_EMAIL" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}$ ]] || {
+    error "Invalid email: $ACME_EMAIL"; exit 1; }
+if [[ -n "$ADMIN_CIDR" ]]; then
+    [[ "$ADMIN_CIDR" =~ ^([0-9]{1,3}[.]){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]] || {
+        error "Invalid CIDR: $ADMIN_CIDR"; exit 1; }
+    [[ "$ADMIN_CIDR" == "0.0.0.0/0" ]] && { error "0.0.0.0/0 is not a trusted CIDR."; exit 1; }
+fi
 
 # Generate a random bootstrap password — never use a hardcoded default
 BOOTSTRAP_PASSWORD=$(openssl rand -base64 24)
@@ -128,9 +145,17 @@ open_ports() {
 
     ufw allow 80/tcp
     ufw allow 443/tcp
-    ufw allow 6443/tcp   # Kubernetes API
-    ufw allow 9345/tcp   # RKE2 supervisor API (needed when adding agent nodes)
-    ufw allow 10250/tcp  # kubelet API (metrics-server)
+    # Kubernetes API (6443), RKE2 supervisor (9345) and kubelet (10250) are
+    # NOT opened to the internet. On a single node nothing external needs
+    # them — Rancher proxies kubectl over 443 (/k8s/clusters/local), and
+    # pods reach them via the pod/service CIDR rules below. Exposing them
+    # publicly invites credential brute force and CVE exploitation.
+    if [[ -n "$ADMIN_CIDR" ]]; then
+        ufw allow from "$ADMIN_CIDR" to any port 6443 proto tcp
+        log "Kube API 6443 allowed from $ADMIN_CIDR only"
+    fi
+    # When adding agent nodes later, allow 9345/6443 from each node's IP only:
+    #   ufw allow from <node-ip> to any port 9345,6443 proto tcp
     # RKE2 pod CIDR (10.42.0.0/16) and service CIDR (10.43.0.0/16)
     ufw allow from 10.42.0.0/16
     ufw allow from 10.43.0.0/16
@@ -170,8 +195,18 @@ install_rke2() {
         cat > "$RKE2_CONFIG_DIR/config.yaml" <<EOF
 cni: none
 disable-kube-proxy: true
+write-kubeconfig-mode: "0600"
+secrets-encryption: true
 EOF
-        curl -sfL https://get.rke2.io | sh -
+        chmod 600 "$RKE2_CONFIG_DIR/config.yaml"
+        # Download, then run — piping into sh executes a truncated script if
+        # the connection drops. The installer verifies the RKE2 tarball's
+        # sha256 itself.
+        local installer
+        installer=$(mktemp)
+        curl -fsSL https://get.rke2.io -o "$installer"
+        INSTALL_RKE2_CHANNEL="$RKE2_CHANNEL" sh "$installer"
+        rm -f "$installer"
         systemctl enable rke2-server
         systemctl start rke2-server
     fi
@@ -194,9 +229,19 @@ install_helm() {
         log "Helm already installed, skipping."
         return
     fi
-    log "Installing Helm..."
-    curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-    success "Helm installed"
+    # Pinned release tarball + checksum instead of piping the installer script
+    # from the helm repo's main branch into a root shell.
+    log "Installing Helm ${HELM_VERSION}..."
+    local tmp tarball
+    tmp=$(mktemp -d)
+    tarball="helm-${HELM_VERSION}-linux-${ARCH_CILIUM}.tar.gz"
+    curl -fsSL -o "$tmp/$tarball"           "https://get.helm.sh/${tarball}"
+    curl -fsSL -o "$tmp/$tarball.sha256sum" "https://get.helm.sh/${tarball}.sha256sum"
+    (cd "$tmp" && sha256sum --check "$tarball.sha256sum")
+    tar -xzf "$tmp/$tarball" -C "$tmp"
+    install -m 755 "$tmp/linux-${ARCH_CILIUM}/helm" /usr/local/bin/helm
+    rm -rf "$tmp"
+    success "Helm ${HELM_VERSION} checksum verified and installed"
 }
 
 # ------------------------------
@@ -208,18 +253,23 @@ install_cilium_cli() {
         return
     fi
     log "Downloading Cilium CLI..."
-    local CILIUM_CLI_VERSION CILIUM_TAR
+    local CILIUM_CLI_VERSION CILIUM_TAR tmp
     CILIUM_CLI_VERSION=$(curl -fsSL https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
+    [[ "$CILIUM_CLI_VERSION" =~ ^v[0-9]+[.][0-9]+[.][0-9]+$ ]] || {
+        error "Unexpected Cilium CLI version string: $CILIUM_CLI_VERSION"; exit 1; }
     CILIUM_TAR="cilium-linux-${ARCH_CILIUM}.tar.gz"
 
-    curl -fsSL -o "$CILIUM_TAR" \
+    # Private temp dir — not the (possibly shared/writable) current directory
+    tmp=$(mktemp -d)
+    curl -fsSL -o "$tmp/$CILIUM_TAR" \
         "https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/${CILIUM_TAR}"
-    curl -fsSL -o "${CILIUM_TAR}.sha256sum" \
+    curl -fsSL -o "$tmp/${CILIUM_TAR}.sha256sum" \
         "https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/${CILIUM_TAR}.sha256sum"
 
-    sha256sum --check "${CILIUM_TAR}.sha256sum"
-    tar -xzf "$CILIUM_TAR" -C /usr/local/bin
-    rm "$CILIUM_TAR" "${CILIUM_TAR}.sha256sum"
+    (cd "$tmp" && sha256sum --check "${CILIUM_TAR}.sha256sum")
+    tar -xzf "$tmp/$CILIUM_TAR" -C "$tmp"
+    install -m 755 "$tmp/cilium" /usr/local/bin/cilium
+    rm -rf "$tmp"
     success "Cilium CLI checksum verified and installed"
 }
 
@@ -312,17 +362,30 @@ install_cert_manager() {
 install_rancher() {
     log "Installing Rancher $RANCHER_VERSION..."
     helm repo add rancher-stable https://releases.rancher.com/server-charts/stable --force-update
+
+    # Bootstrap password goes in a root-only values file, not --set: command
+    # line arguments are readable by every local user via ps.
+    local values
+    values=$(mktemp)   # 0600
+    printf 'bootstrapPassword: "%s"\n' "$BOOTSTRAP_PASSWORD" > "$values"
+
     helm upgrade --install rancher rancher-stable/rancher \
         --namespace cattle-system \
         --create-namespace \
         --version "$RANCHER_VERSION" \
+        --values "$values" \
         --set hostname="$RANCHER_HOSTNAME" \
-        --set bootstrapPassword="$BOOTSTRAP_PASSWORD" \
         --set ingress.tls.source=letsEncrypt \
         --set letsEncrypt.email="$ACME_EMAIL" \
         --set letsEncrypt.ingress.class=nginx \
         --atomic \
         --timeout 300s
+    rm -f "$values"
+
+    # Saved root-only instead of printed, so it never lands in terminal
+    # scrollback, tmux logs or CI output. Delete it after first login.
+    rm -f "$BOOTSTRAP_FILE"
+    ( umask 077; printf '%s\n' "$BOOTSTRAP_PASSWORD" > "$BOOTSTRAP_FILE" )
     success "Rancher deployed"
 }
 
@@ -426,7 +489,15 @@ spec:
   egress:
   - to:
     - podSelector: {}
-  - to: []
+  # DNS only to cluster CoreDNS — "to: []" allowed port 53 to ANY host,
+  # an open channel for DNS tunnelling / exfiltration.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
     ports:
     - port: 53
       protocol: UDP
@@ -460,7 +531,13 @@ spec:
   egress:
   - to:
     - podSelector: {}
-  - to: []
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
     ports:
     - port: 53
       protocol: UDP
@@ -483,10 +560,10 @@ setup_namespaces
 echo ""
 success "==========================================================="
 success " Rancher:            https://$RANCHER_HOSTNAME"
-success " Bootstrap password: $BOOTSTRAP_PASSWORD"
+success " Bootstrap password: sudo cat $BOOTSTRAP_FILE"
 success " Namespaces:         prod, sandbox (network-isolated)"
 success "==========================================================="
-warning "Save the bootstrap password above — it will not be shown again."
+warning "After setting your permanent admin password: sudo shred -u $BOOTSTRAP_FILE"
 echo ""
 log "Next steps:"
 echo "  1. Point DNS: $RANCHER_HOSTNAME → this VM's public IP"

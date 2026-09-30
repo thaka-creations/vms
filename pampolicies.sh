@@ -60,7 +60,6 @@ log "Configuring pam_unix module..."
 cat > /etc/pam.d/common-account << 'EOF'
 # Account management via Unix and faillock
 account [success=1 new_authtok_reqd=done default=ignore]        pam_unix.so
-password requisite pam_pwquality.so retry=3
 account requisite                       pam_deny.so
 account required                        pam_permit.so
 account required                        pam_faillock.so
