@@ -637,7 +637,7 @@ install_cert_manager() {
         --namespace cert-manager \
         --create-namespace \
         --version "$CERT_MANAGER_VERSION" \
-        --set config.gatewayAPI.enabled=true \
+        --set config.enableGatewayAPI=true \
         --wait --wait-for-jobs \
         --timeout 5m; then
         error "cert-manager install failed — current state:"
