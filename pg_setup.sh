@@ -103,6 +103,9 @@ configure_postgres() {
 listen_addresses          = 'localhost'   # never expose on 0.0.0.0 unless explicitly needed
 port                      = ${PG_PORT}
 ssl                       = on
+ssl_cert_file             = '${CONF_DIR}/server.crt'   # generated below (was left on the snakeoil cert)
+ssl_key_file              = '${CONF_DIR}/server.key'
+ssl_min_protocol_version  = 'TLSv1.2'
 password_encryption       = scram-sha-256 # stronger than md5; required for pg_hba scram entries
 
 max_connections           = 100
@@ -155,6 +158,12 @@ create_roles_and_db() {
     log "Creating role hierarchy and database..."
 
     sudo -u postgres psql -v ON_ERROR_STOP=1 <<SQL
+-- This session carries plaintext passwords — keep them out of the server log
+-- (log_statement = 'ddl' is enabled above).
+SET log_statement = 'none';
+SET log_min_duration_statement = -1;
+SET log_min_error_statement = 'panic';
+
 -- ── Group role ──────────────────────────────────────────────────────────────
 -- NOLOGIN, NOINHERIT: a pure permission container, never used to connect.
 -- Every schema object is owned by this role so privilege grants are uniform.
@@ -260,6 +269,9 @@ SQL
 # Save credentials to a root-only env file
 # ------------------------------
 save_credentials() {
+    # Create the file root-only from the start; chmod after the write would
+    # leave a window where it is world-readable (default umask 022).
+    rm -f "$CREDS_FILE"; ( umask 077; : > "$CREDS_FILE" )
     cat > "$CREDS_FILE" <<EOF
 # PostgreSQL credentials — ${APP_NAME}
 # Generated: $(date -u +"%Y-%m-%dT%H:%M:%SZ")

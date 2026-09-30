@@ -1,1 +1,11 @@
 .notes
+
+# kubeconfigs, credentials, keys — never commit
+local.yaml
+*.kubeconfig
+kubeconfig*
+*.env
+.env*
+*.pem
+*.key
+id_*

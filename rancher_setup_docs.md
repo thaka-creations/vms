@@ -71,7 +71,7 @@ Estimated runtime: **8–12 minutes** on a clean VM.
 ## What It Does (in order)
 
 ### 1. `open_ports`
-Opens TCP 80 and 443 in UFW. Port 80 is required for the Let's Encrypt HTTP-01 ACME challenge.
+Opens TCP 80 and 443 in UFW (port 80 is required for the Let's Encrypt HTTP-01 ACME challenge) and keeps the SSH port open. The Kubernetes API (6443), RKE2 supervisor (9345) and kubelet (10250) are **not** exposed publicly; 6443 is opened only to the optional trusted admin CIDR you enter. Use Rancher's kubeconfig (proxied over 443) for remote kubectl.
 
 ### 2. `install_k3s`
 Installs k3s with two flags:
@@ -101,7 +101,7 @@ Installs the nginx ingress controller as a LoadBalancer service. Used by both Ra
 Installs cert-manager for automatic TLS certificate provisioning via Let's Encrypt. CRDs are applied before the Helm chart.
 
 ### 7. `install_rancher`
-Installs Rancher into the `cattle-system` namespace. TLS is sourced from Let's Encrypt via cert-manager. The bootstrap password is **randomly generated** with `openssl rand -base64 24` and printed once at the end of the script.
+Installs Rancher into the `cattle-system` namespace. TLS is sourced from Let's Encrypt via cert-manager. The bootstrap password is **randomly generated** with `openssl rand -base64 24` and saved to `/root/.rancher_bootstrap_password` (root-only) — it is never printed or passed on the command line.
 
 ### 8. `setup_namespaces`
 Creates `prod` and `sandbox` namespaces with three layers of isolation:
@@ -112,7 +112,7 @@ Creates `prod` and `sandbox` namespaces with three layers of isolation:
 
 **NetworkPolicies** — two policies per namespace:
 - `default-deny-all`: blocks all ingress and egress by default
-- `allow-intra-namespace`: permits traffic between pods within the same namespace, plus DNS egress (port 53) so service discovery works
+- `allow-intra-namespace`: permits traffic between pods within the same namespace, plus DNS egress (port 53) to cluster CoreDNS only
 
 Traffic between `prod` and `sandbox` is blocked unless you explicitly add a policy to allow it.
 
@@ -136,7 +136,7 @@ Point an A record for your Rancher domain to the VM's public IP. Let's Encrypt w
 ### 2. First Login
 ```
 URL:      https://<your-domain>
-Password: printed at end of script — save it before closing the terminal
+Password: `sudo cat /root/.rancher_bootstrap_password` — delete it with `sudo shred -u` after first login
 ```
 Set a permanent admin password on first login.
 

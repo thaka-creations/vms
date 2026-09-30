@@ -114,6 +114,9 @@ setup_auditd() {
 -w /etc/apparmor/ -p wa -k mac_policy
 -w /etc/apparmor.d/ -p wa -k mac_policy
 -w /etc/ssh/sshd_config -p wa -k ssh_config
+-w /etc/ssh/sshd_config.d/ -p wa -k ssh_config
+-w /etc/modprobe.d/ -p wa -k modules
+-w /etc/profile.d/ -p wa -k shell_env
 -w /boot -p wa -k boot_changes
 -w /etc/crontab -p wa -k cron_changes
 -w /etc/cron.d/ -p wa -k cron_changes
@@ -192,7 +195,16 @@ EOF
 ## Set up ossec agents
 setup_ossec_hids(){
     log "🛠️ Installing ossec-hids."
-    wget -q -O - https://updates.atomicorp.com/installers/atomic | sudo bash
+    # Download, then run — never pipe a remote script straight into a root
+    # shell (a truncated download executes a partial script). Inspect it first.
+    local installer
+    installer=$(mktemp)
+    wget -q -O "$installer" https://updates.atomicorp.com/installers/atomic
+    less "$installer"
+    read -rp "Run this installer as root? (yes/no): " ok
+    [[ "$ok" == "yes" ]] || { rm -f "$installer"; return; }
+    bash "$installer"
+    rm -f "$installer"
     apt-get update
     apt-get install ossec-hids-agent
 }
@@ -266,7 +278,12 @@ install_clamav(){
 
 disable_usb(){
   log "Disabling usb"
-  echo "blacklist usb-storage" >> /etc/modprobe.d/blacklist.conf
+  # "blacklist" only stops auto-loading; "install ... /bin/false" also blocks
+  # an explicit modprobe. Own file so re-runs don't append duplicates.
+  cat > /etc/modprobe.d/disable-usb-storage.conf <<'EOF'
+blacklist usb-storage
+install usb-storage /bin/false
+EOF
 }
 
 disable_services() {

@@ -96,6 +96,11 @@ setup_schema() {
     log "Setting up schema: ${SCHEMA}..."
 
     sudo -u postgres psql -v ON_ERROR_STOP=1 -d "${DB_NAME}" <<SQL
+-- This session carries plaintext passwords — keep them out of the server log.
+SET log_statement = 'none';
+SET log_min_duration_statement = -1;
+SET log_min_error_statement = 'panic';
+
 -- ── Group roles (NOLOGIN) ────────────────────────────────────────────────────
 DO \$\$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${OWNER_ROLE}') THEN
@@ -194,6 +199,8 @@ done
 # ------------------------------
 # Save credentials
 # ------------------------------
+# Root-only from creation — no world-readable window before the chmod.
+rm -f "$CREDS_FILE"; ( umask 077; : > "$CREDS_FILE" )
 {
     echo "# Schema credentials — ${DB_NAME}"
     echo "# Generated: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
