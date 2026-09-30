@@ -37,6 +37,8 @@ if command -v helm &>/dev/null && kubectl cluster-info &>/dev/null 2>&1; then
     helm uninstall rancher       -n cattle-system  2>/dev/null && log "Rancher removed"       || warning "Rancher not found"
     helm uninstall cert-manager  -n cert-manager   2>/dev/null && log "cert-manager removed"  || warning "cert-manager not found"
     helm uninstall ingress-nginx -n ingress-nginx  2>/dev/null && log "ingress-nginx removed" || warning "ingress-nginx not found"
+    helm uninstall eg            -n envoy-gateway-system 2>/dev/null && log "Envoy Gateway removed" || warning "Envoy Gateway not found"
+    kubectl delete gatewayclass envoy --ignore-not-found 2>/dev/null || true
 fi
 
 # ------------------------------
@@ -54,7 +56,7 @@ fi
 # Force-delete stuck namespaces
 # ------------------------------
 log "Removing namespaces..."
-for NS in cattle-system cert-manager ingress-nginx cilium-secrets prod sandbox; do
+for NS in cattle-system cert-manager ingress-nginx envoy-gateway-system cilium-secrets prod sandbox; do
     if kubectl get namespace "$NS" &>/dev/null 2>&1; then
         kubectl get namespace "$NS" -o json \
             | python3 -c "import sys,json; ns=json.load(sys.stdin); ns['spec']['finalizers']=[]; print(json.dumps(ns))" \
@@ -68,7 +70,7 @@ done
 # Remove cert-manager and Cilium CRDs
 # ------------------------------
 log "Removing CRDs..."
-kubectl get crds 2>/dev/null | grep -E "cert-manager|cilium" | awk '{print $1}' \
+kubectl get crds 2>/dev/null | grep -E "cert-manager|cilium|envoyproxy\.io" | awk '{print $1}' \
     | xargs kubectl delete crd --ignore-not-found 2>/dev/null || true
 
 # ------------------------------
