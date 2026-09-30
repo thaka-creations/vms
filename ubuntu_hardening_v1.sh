@@ -401,8 +401,17 @@ echo "✅ AppArmor enabled and profiles enforced."
 # ------------------------------
 echo "⏰ Setting timezone to East Africa Time (EAT) and enabling time synchronization..."
 sudo timedatectl set-timezone Africa/Nairobi
-sudo systemctl enable systemd-timesyncd
-sudo systemctl start systemd-timesyncd
+# Some images (Ubuntu 25.10+, many cloud images) ship chrony instead of
+# systemd-timesyncd — the two conflict, so use whichever is present and
+# only install timesyncd when neither is.
+if [[ -n "$(systemctl list-unit-files chrony.service --no-legend 2>/dev/null)" ]]; then
+  sudo systemctl enable --now chrony
+else
+  if [[ -z "$(systemctl list-unit-files systemd-timesyncd.service --no-legend 2>/dev/null)" ]]; then
+    sudo apt install -y systemd-timesyncd
+  fi
+  sudo systemctl enable --now systemd-timesyncd
+fi
 sudo timedatectl set-ntp true
 echo "✅ Timezone set to EAT and time synchronization enabled."
 
