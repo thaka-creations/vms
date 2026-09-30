@@ -1,8 +1,13 @@
 #!/bin/bash
 
 # Rancher + Kubernetes (RKE2) Single-VM Setup
-# Installs RKE2, Helm, Cilium CNI, nginx ingress, cert-manager, and Rancher.
-# Creates prod and sandbox namespaces with quotas and network isolation.
+# Installs RKE2, Helm, Cilium CNI, Envoy Gateway (Gateway API), cert-manager,
+# and Rancher. Creates prod and sandbox namespaces with quotas and network
+# isolation.
+#
+# Traffic path:  internet → :80/:443 on the node IP (Cilium node IPAM, eBPF)
+#                → Envoy proxy (envoy-gateway-system) → HTTPRoute → Service
+# TLS is terminated at Envoy with Let's Encrypt certs issued by cert-manager.
 # Run on Ubuntu 22.04+ as root.
 
 set -euo pipefail
@@ -21,9 +26,15 @@ warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 # Pinned versions — update deliberately, not automatically
 RANCHER_VERSION="2.14.1"
 CERT_MANAGER_VERSION="v1.20.2"
-INGRESS_NGINX_VERSION="4.15.1"
+ENVOY_GATEWAY_VERSION="v1.9.2"
+GATEWAY_API_MIN_VERSION="v1.6.0"   # Envoy Gateway 1.9 is built against Gateway API v1.6
 HELM_VERSION="v3.19.0"
-RKE2_CHANNEL="stable"   # or pin a minor, e.g. "v1.33"
+# Rancher 2.14.x requires Kubernetes < 1.36 — the "stable" channel is already
+# 1.36, so pin the minor. Bump together with RANCHER_VERSION.
+RKE2_CHANNEL="v1.35"
+
+GATEWAY_NS="envoy-gateway-system"
+GATEWAY_NAME="public"
 
 BOOTSTRAP_FILE="/root/.rancher_bootstrap_password"
 
@@ -38,7 +49,7 @@ wait_for_api() {
     log "Waiting for Kubernetes API server..."
     local i=0
     until kubectl cluster-info &>/dev/null; do
-        ((i++))
+        i=$((i + 1))
         if [[ $i -gt 30 ]]; then
             error "API server not ready after 60s — check: journalctl -u rke2-server -n 50"
             exit 1
@@ -55,7 +66,7 @@ wait_for_coredns() {
     local i=0
     until kubectl get pods -n kube-system -l k8s-app=kube-dns --no-headers 2>/dev/null \
             | grep -q "1/1.*Running"; do
-        ((i++))
+        i=$((i + 1))
         if [[ $i -gt 24 ]]; then
             error "CoreDNS not ready after 2m — check: kubectl describe pods -n kube-system -l k8s-app=kube-dns"
             exit 1
@@ -81,11 +92,19 @@ check_root
 read -rp "Enter your Rancher domain (e.g. rancher.yourdomain.com): " RANCHER_HOSTNAME
 read -rp "Enter your email for Let's Encrypt certs: " ACME_EMAIL
 read -rp "Trusted admin CIDR for direct kube-API access (e.g. 203.0.113.4/32, blank = none): " ADMIN_CIDR
+read -rp "App hostnames served from prod/sandbox, space-separated (e.g. api.example.com, blank = none): " APP_HOSTNAMES_INPUT
+read -ra APP_HOSTNAMES <<< "$APP_HOSTNAMES_INPUT"
 
 # These go into `helm --set`, where a comma or '=' would inject extra chart
 # values — validate strictly.
-[[ "$RANCHER_HOSTNAME" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?[.])+[a-zA-Z]{2,}$ ]] || {
+HOSTNAME_RE='^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?[.])+[a-zA-Z]{2,}$'
+[[ "$RANCHER_HOSTNAME" =~ $HOSTNAME_RE ]] || {
     error "Invalid hostname: $RANCHER_HOSTNAME"; exit 1; }
+# Hostnames are also interpolated into Gateway YAML — same strict check.
+for h in ${APP_HOSTNAMES[@]+"${APP_HOSTNAMES[@]}"}; do
+    [[ "$h" =~ $HOSTNAME_RE ]] || { error "Invalid app hostname: $h"; exit 1; }
+    [[ "$h" != "$RANCHER_HOSTNAME" ]] || { error "App hostname must differ from the Rancher hostname."; exit 1; }
+done
 [[ "$ACME_EMAIL" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}$ ]] || {
     error "Invalid email: $ACME_EMAIL"; exit 1; }
 if [[ -n "$ADMIN_CIDR" ]]; then
@@ -188,6 +207,16 @@ install_rke2() {
             echo "disable-kube-proxy: true" >> "$cfg"
             needs_restart=true
         fi
+        # Envoy Gateway replaces the bundled ingress controllers.
+        if ! grep -q "rke2-ingress-nginx" "$cfg" 2>/dev/null; then
+            if grep -qE '^disable:' "$cfg"; then
+                error "$cfg already has a 'disable:' list — add rke2-ingress-nginx and rke2-traefik to it, then re-run."
+                exit 1
+            fi
+            warning "RKE2 config: disabling bundled ingress controllers — patching..."
+            printf 'disable:\n  - rke2-ingress-nginx\n  - rke2-traefik\n' >> "$cfg"
+            needs_restart=true
+        fi
         [[ "$needs_restart" == true ]] && systemctl restart rke2-server
     else
         log "Installing RKE2..."
@@ -197,6 +226,11 @@ cni: none
 disable-kube-proxy: true
 write-kubeconfig-mode: "0600"
 secrets-encryption: true
+# Envoy Gateway is the only entry point; the bundled controllers would
+# otherwise bind :80/:443 on the host.
+disable:
+  - rke2-ingress-nginx
+  - rke2-traefik
 EOF
         chmod 600 "$RKE2_CONFIG_DIR/config.yaml"
         # Download, then run — piping into sh executes a truncated script if
@@ -218,6 +252,10 @@ EOF
 
     setup_kubeconfig
     wait_for_api
+
+    # Disabling in config.yaml stops new deploys; an already-running bundled
+    # controller must be removed explicitly (helm-controller uninstalls it).
+    kubectl delete helmchart rke2-ingress-nginx rke2-traefik -n kube-system --ignore-not-found
     log "RKE2 ready (node NotReady until Cilium is up — expected)"
 }
 
@@ -287,6 +325,14 @@ install_cilium() {
         ready=$(kubectl get pods -n kube-system -l k8s-app=cilium --no-headers 2>/dev/null \
             | grep -c "1/1 *Running" || true)
         if [[ "${ready:-0}" -gt 0 ]]; then
+            # Existing clusters predate the Envoy Gateway setup — make sure
+            # node IPAM (LoadBalancer on the node IP) is on.
+            if ! helm get values cilium -n kube-system --all 2>/dev/null \
+                    | grep -A1 '^nodeIPAM:' | grep -q 'enabled: true'; then
+                log "Enabling Cilium node IPAM for the Envoy LoadBalancer..."
+                cilium upgrade --reuse-values --set nodeIPAM.enabled=true
+                cilium status --wait --wait-duration=5m
+            fi
             log "Cilium already running and healthy, skipping."
             return
         fi
@@ -313,6 +359,7 @@ install_cilium() {
         --set k8sServiceHost="${NODE_IP}" \
         --set k8sServicePort=6443 \
         --set kubeProxyReplacement=true \
+        --set nodeIPAM.enabled=true \
         --set hubble.enabled=true \
         --set hubble.relay.enabled=true \
         --set hubble.ui.enabled=true
@@ -325,19 +372,203 @@ install_cilium() {
 }
 
 # ------------------------------
-# Install nginx ingress (pinned version)
+# Install Envoy Gateway (pinned version)
+# Must run before cert-manager: cert-manager only detects Gateway API CRDs
+# at startup.
 # ------------------------------
-install_nginx_ingress() {
-    log "Installing nginx ingress controller $INGRESS_NGINX_VERSION..."
-    helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx --force-update
-    helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
-        --namespace ingress-nginx \
+install_envoy_gateway() {
+    log "Installing Envoy Gateway ${ENVOY_GATEWAY_VERSION}..."
+
+    # Let RKE2's addon jobs finish so any Gateway API CRDs it manages exist
+    # before we decide who owns them.
+    kubectl wait --for=condition=complete job -n kube-system \
+        -l helmcharts.helm.cattle.io/chart --timeout=300s &>/dev/null \
+        || warning "Some RKE2 addon jobs are still running — continuing."
+
+    # Gateway API CRDs are cluster-wide and shared. If something else (RKE2 ≥1.37
+    # bundles them) already manages a new-enough version, leave it as owner and
+    # install only Envoy Gateway's own CRDs; two owners fighting over the same
+    # CRDs is how they get downgraded or deleted.
+    local crd="gateways.gateway.networking.k8s.io" existing managers install_gw_api
+    existing=$(kubectl get crd "$crd" \
+        -o jsonpath='{.metadata.annotations.gateway\.networking\.k8s\.io/bundle-version}' 2>/dev/null || true)
+    managers=$(kubectl get crd "$crd" -o jsonpath='{.metadata.managedFields[*].manager}' 2>/dev/null || true)
+
+    if [[ -z "$existing" || "$managers" == *vms-envoy-gateway* ]]; then
+        log "Installing Gateway API CRDs (standard channel) with Envoy Gateway"
+        install_gw_api=true
+    elif [[ "$(printf '%s\n%s\n' "$GATEWAY_API_MIN_VERSION" "$existing" | sort -V | head -1)" == "$GATEWAY_API_MIN_VERSION" ]]; then
+        log "Gateway API ${existing} already managed by the cluster — keeping that owner"
+        install_gw_api=false
+    else
+        error "Cluster provides Gateway API ${existing}; Envoy Gateway ${ENVOY_GATEWAY_VERSION} needs >= ${GATEWAY_API_MIN_VERSION}."
+        error "Upgrade RKE2 (which owns those CRDs) or pin an older ENVOY_GATEWAY_VERSION."
+        exit 1
+    fi
+
+    # helm template | apply --server-side: the upstream-recommended way, because
+    # Helm never upgrades CRDs it installed from a chart's crds/ directory.
+    helm template eg-crds oci://docker.io/envoyproxy/gateway-crds-helm \
+        --version "$ENVOY_GATEWAY_VERSION" \
+        --set crds.gatewayAPI.enabled="$install_gw_api" \
+        --set crds.gatewayAPI.channel=standard \
+        --set crds.envoyGateway.enabled=true \
+        | kubectl apply --server-side --field-manager=vms-envoy-gateway -f -
+
+    helm upgrade --install eg oci://docker.io/envoyproxy/gateway-helm \
+        --version "$ENVOY_GATEWAY_VERSION" \
+        --namespace "$GATEWAY_NS" \
         --create-namespace \
-        --version "$INGRESS_NGINX_VERSION" \
-        --set controller.service.type=LoadBalancer \
+        --set crds.enabled=false \
         --atomic \
         --timeout 300s
-    success "nginx ingress ready"
+    kubectl wait --for=condition=Available deployment/envoy-gateway \
+        -n "$GATEWAY_NS" --timeout=300s
+
+    # EnvoyProxy: how the data plane is exposed.
+    # - LoadBalancer with class io.cilium/node → Cilium answers on the node IP
+    #   :80/:443 (no cloud LB needed on a single VM).
+    # - externalTrafficPolicy Local → real client IPs reach Envoy (logs,
+    #   rate limits, IP allow-lists).
+    # - No NodePorts: Cilium's eBPF datapath handles them before UFW/iptables,
+    #   so they would be reachable from the internet on 30000-32767.
+    kubectl apply -f - <<EOF
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: public-proxy
+  namespace: ${GATEWAY_NS}
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyService:
+        type: LoadBalancer
+        loadBalancerClass: io.cilium/node
+        externalTrafficPolicy: Local
+        allocateLoadBalancerNodePorts: false
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: envoy
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+  parametersRef:
+    group: gateway.envoyproxy.io
+    kind: EnvoyProxy
+    name: public-proxy
+    namespace: ${GATEWAY_NS}
+EOF
+    success "Envoy Gateway ${ENVOY_GATEWAY_VERSION} ready"
+}
+
+# ------------------------------
+# Public Gateway: one HTTP listener (ACME challenges + redirect to HTTPS) and
+# one HTTPS listener per hostname, each with its own Let's Encrypt cert.
+# ------------------------------
+setup_gateway() {
+    log "Creating public Gateway..."
+
+    # One HTTPS listener per app hostname. Only namespaces labelled
+    # gateway-access=true (prod, sandbox) may attach routes to them.
+    local app_listeners="" i=0 h
+    for h in ${APP_HOSTNAMES[@]+"${APP_HOSTNAMES[@]}"}; do
+        i=$((i + 1))
+        app_listeners+="
+  - name: https-app-${i}
+    protocol: HTTPS
+    port: 443
+    hostname: ${h}
+    tls:
+      mode: Terminate
+      certificateRefs:
+      - name: app-${i}-tls
+    allowedRoutes:
+      namespaces:
+        from: Selector
+        selector:
+          matchLabels:
+            gateway-access: \"true\""
+    done
+
+    kubectl apply -f - <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: ${GATEWAY_NAME}
+  namespace: ${GATEWAY_NS}
+  annotations:
+    # cert-manager creates a Certificate for every HTTPS listener below
+    cert-manager.io/cluster-issuer: letsencrypt
+spec:
+  gatewayClassName: envoy
+  listeners:
+  # Plain HTTP: only routes from this namespace may attach — the HTTPS
+  # redirect and cert-manager's ACME challenge routes. Apps can't serve
+  # plaintext.
+  - name: http
+    protocol: HTTP
+    port: 80
+    allowedRoutes:
+      namespaces:
+        from: Same
+  # Rancher UI/API — only routes from cattle-system may attach.
+  - name: https-rancher
+    protocol: HTTPS
+    port: 443
+    hostname: ${RANCHER_HOSTNAME}
+    tls:
+      mode: Terminate
+      certificateRefs:
+      - name: rancher-tls
+    allowedRoutes:
+      namespaces:
+        from: Selector
+        selector:
+          matchLabels:
+            kubernetes.io/metadata.name: cattle-system${app_listeners}
+---
+# Redirect all plain-HTTP traffic to HTTPS. cert-manager's challenge routes
+# match an exact path, so they take precedence over this catch-all.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: https-redirect
+  namespace: ${GATEWAY_NS}
+spec:
+  parentRefs:
+  - name: ${GATEWAY_NAME}
+    sectionName: http
+  rules:
+  - filters:
+    - type: RequestRedirect
+      requestRedirect:
+        scheme: https
+        statusCode: 301
+---
+# Client-side hardening for every listener on the Gateway.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: ClientTrafficPolicy
+metadata:
+  name: public-client
+  namespace: ${GATEWAY_NS}
+spec:
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: ${GATEWAY_NAME}
+  tls:
+    minVersion: "1.2"
+  headers:
+    # Headers with underscores are a request-smuggling / header-spoofing
+    # vector (X_Forwarded_For vs X-Forwarded-For) — reject them.
+    withUnderscoresAction: RejectRequest
+EOF
+
+    kubectl wait --for=condition=Programmed "gateway/${GATEWAY_NAME}" \
+        -n "$GATEWAY_NS" --timeout=300s
+    success "Gateway programmed — listening on the node IP :80/:443"
 }
 
 # ------------------------------
@@ -351,9 +582,44 @@ install_cert_manager() {
         --namespace cert-manager \
         --create-namespace \
         --version "$CERT_MANAGER_VERSION" \
+        --set config.gatewayAPI.enabled=true \
         --atomic \
         --timeout 120s
-    success "cert-manager ready"
+    # Gateway API support is detected only at startup — restart in case the
+    # release already existed from before the CRDs were installed.
+    kubectl rollout restart deployment cert-manager -n cert-manager
+    kubectl rollout status  deployment cert-manager -n cert-manager --timeout=120s
+
+    # HTTP-01 challenges are answered through the Gateway's plain-HTTP
+    # listener. The webhook can take a few seconds after rollout to accept
+    # requests, so retry.
+    local i=0
+    until kubectl apply -f - <<EOF
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: ${ACME_EMAIL}
+    privateKeySecretRef:
+      name: letsencrypt-account-key
+    solvers:
+    - http01:
+        gatewayHTTPRoute:
+          parentRefs:
+          - name: ${GATEWAY_NAME}
+            namespace: ${GATEWAY_NS}
+            kind: Gateway
+            sectionName: http
+EOF
+    do
+        i=$((i + 1))
+        [[ $i -gt 12 ]] && { error "cert-manager webhook not accepting requests after 60s"; exit 1; }
+        sleep 5
+    done
+    success "cert-manager ready (Gateway API enabled, ClusterIssuer 'letsencrypt')"
 }
 
 # ------------------------------
@@ -375,12 +641,44 @@ install_rancher() {
         --version "$RANCHER_VERSION" \
         --values "$values" \
         --set hostname="$RANCHER_HOSTNAME" \
-        --set ingress.tls.source=letsEncrypt \
-        --set letsEncrypt.email="$ACME_EMAIL" \
-        --set letsEncrypt.ingress.class=nginx \
+        --set ingress.enabled=false \
+        --set tls=external \
+        --set agentTLSMode=system-store \
         --atomic \
         --timeout 300s
     rm -f "$values"
+
+    # TLS terminates at Envoy (tls=external); Rancher serves plain HTTP on the
+    # Service's port 80 inside the cluster. agentTLSMode=system-store: agents
+    # trust the Let's Encrypt cert via the OS CA bundle.
+    kubectl apply -f - <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: rancher
+  namespace: cattle-system
+spec:
+  parentRefs:
+  - name: ${GATEWAY_NAME}
+    namespace: ${GATEWAY_NS}
+    sectionName: https-rancher
+  hostnames:
+  - ${RANCHER_HOSTNAME}
+  rules:
+  - backendRefs:
+    - name: rancher
+      port: 80
+    # Rancher streams watches and websockets (kubectl, shells, logs);
+    # 0s disables the per-request timeout so they aren't cut off.
+    timeouts:
+      request: 0s
+    filters:
+    - type: ResponseHeaderModifier
+      responseHeaderModifier:
+        set:
+        - name: Strict-Transport-Security
+          value: max-age=31536000; includeSubDomains
+EOF
 
     # Saved root-only instead of printed, so it never lands in terminal
     # scrollback, tmux logs or CI output. Delete it after first login.
@@ -399,7 +697,8 @@ setup_namespaces() {
 
     for NS in prod sandbox; do
         kubectl get namespace "$NS" &>/dev/null || kubectl create namespace "$NS"
-        kubectl label namespace "$NS" environment="$NS" --overwrite
+        # gateway-access=true lets HTTPRoutes here attach to the app listeners
+        kubectl label namespace "$NS" environment="$NS" gateway-access=true --overwrite
     done
 
     kubectl apply -f - <<EOF
@@ -543,6 +842,49 @@ spec:
       protocol: UDP
     - port: 53
       protocol: TCP
+---
+# ── Let the Envoy proxy reach app pods ──────────────────────────────────────
+# default-deny-all blocks everything from outside the namespace, including
+# the gateway — without this no app behind an HTTPRoute is reachable.
+# Scoped to Envoy's proxy pods only, not the whole envoy-gateway-system
+# namespace (the controller never needs to call app pods).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-from-gateway
+  namespace: prod
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ${GATEWAY_NS}
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: envoy
+          app.kubernetes.io/component: proxy
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-from-gateway
+  namespace: sandbox
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ${GATEWAY_NS}
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: envoy
+          app.kubernetes.io/component: proxy
 EOF
 
     success "Namespaces, quotas, LimitRanges, and NetworkPolicies applied"
@@ -553,7 +895,9 @@ install_rke2
 install_helm
 install_cilium
 wait_for_coredns
+install_envoy_gateway
 install_cert_manager
+setup_gateway
 install_rancher
 setup_namespaces
 
@@ -561,12 +905,32 @@ echo ""
 success "==========================================================="
 success " Rancher:            https://$RANCHER_HOSTNAME"
 success " Bootstrap password: sudo cat $BOOTSTRAP_FILE"
+success " Gateway:            ${GATEWAY_NS}/${GATEWAY_NAME} (Envoy Gateway ${ENVOY_GATEWAY_VERSION})"
+for idx in "${!APP_HOSTNAMES[@]}"; do
+success " App listener:       https-app-$((idx + 1)) → ${APP_HOSTNAMES[$idx]}"
+done
 success " Namespaces:         prod, sandbox (network-isolated)"
 success "==========================================================="
 warning "After setting your permanent admin password: sudo shred -u $BOOTSTRAP_FILE"
 echo ""
 log "Next steps:"
-echo "  1. Point DNS: $RANCHER_HOSTNAME → this VM's public IP"
+echo "  1. Point DNS: $RANCHER_HOSTNAME ${APP_HOSTNAMES[*]+${APP_HOSTNAMES[*]} }→ this VM's public IP"
+echo "     (certificates are issued once DNS resolves: kubectl get certificate -n ${GATEWAY_NS})"
 echo "  2. Login to Rancher and set your permanent admin password"
 echo "  3. Cluster → Projects/Namespaces → assign prod and sandbox to separate Projects"
 echo "  4. source ~/.bashrc   (or open a new terminal) to pick up KUBECONFIG"
+echo "  5. Expose an app — HTTPRoute in prod/sandbox attached to its listener:"
+cat <<EOF
+       apiVersion: gateway.networking.k8s.io/v1
+       kind: HTTPRoute
+       metadata: { name: my-api, namespace: prod }
+       spec:
+         parentRefs:
+         - { name: ${GATEWAY_NAME}, namespace: ${GATEWAY_NS}, sectionName: https-app-1 }
+         hostnames: [ "${APP_HOSTNAMES[0]:-api.example.com}" ]
+         rules:
+         - backendRefs: [ { name: my-api, port: 8080 } ]
+EOF
+echo "     New hostname later? Re-run with ALL app hostnames — the listener list is replaced on each run."
+echo "     Pods are default-deny for egress too — add a NetworkPolicy for any outbound"
+echo "     traffic an app needs (external APIs, databases)."
