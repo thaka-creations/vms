@@ -348,8 +348,17 @@ install_cilium() {
             | grep -c "1/1 *Running" || true)
         # Pods must get IPs from POD_CIDR — UFW only trusts that range, so
         # Cilium's default pool (10.0.0.0/8) gets pod→node traffic dropped.
-        helm get values cilium -n kube-system --all 2>/dev/null \
-            | grep -qF "$POD_CIDR" && pool_ok=true
+        # Check both the configured pool and what each node was actually
+        # allocated: a node keeps its CIDR (on its CiliumNode) across a pool
+        # change.
+        local pod_prefix="${POD_CIDR%.*.*}." node_cidrs
+        node_cidrs=$(kubectl get ciliumnodes \
+            -o jsonpath='{range .items[*]}{.spec.ipam.podCIDRs[*]}{"\n"}{end}' 2>/dev/null \
+            | tr ' ' '\n' | grep -v '^$' || true)
+        if helm get values cilium -n kube-system --all 2>/dev/null | grep -qF "$POD_CIDR" \
+                && ! grep -qv "^${pod_prefix//./\\.}" <<< "$node_cidrs"; then
+            pool_ok=true
+        fi
         if [[ "$pool_ok" != true ]]; then
             warning "Cilium pod CIDR is not $POD_CIDR — reinstalling..."
             ready=0
@@ -375,6 +384,9 @@ install_cilium() {
             || helm uninstall cilium -n kube-system --wait 2>/dev/null \
             || true
         kubectl delete namespace cilium-secrets --force --grace-period=0 2>/dev/null || true
+        # Uninstall leaves CiliumNode objects behind; the new operator would
+        # reuse their old pod CIDRs instead of allocating from POD_CIDR.
+        kubectl delete ciliumnodes --all --ignore-not-found 2>/dev/null || true
         sleep 5
     fi
 
