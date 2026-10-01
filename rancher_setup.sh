@@ -992,6 +992,6 @@ cat <<EOF
          rules:
          - backendRefs: [ { name: my-api, port: 8080 } ]
 EOF
-echo "     New hostname later? Re-run with ALL app hostnames — the listener list is replaced on each run."
+echo "     New hostname later? bash gateway_add_hostname.sh <hostname> (adds one listener, touches nothing else)."
 echo "     Pods are default-deny for egress too — add a NetworkPolicy for any outbound"
 echo "     traffic an app needs (external APIs, databases)."
