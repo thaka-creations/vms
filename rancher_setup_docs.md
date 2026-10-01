@@ -199,7 +199,14 @@ spec:
       port: 8080
 ```
 
-**Adding a hostname later:** re-run the script with *all* app hostnames. The listener list is replaced on every run, so manual edits to the Gateway are overwritten.
+**Adding a hostname later:** use `gateway_add_hostname.sh`. It appends one HTTPS listener (and certificate) per hostname and changes nothing else, with no Helm upgrades or restarts. Hostnames already on the Gateway are skipped.
+
+```bash
+bash gateway_add_hostname.sh --dry-run new.example.com   # validate only
+bash gateway_add_hostname.sh new.example.com
+```
+
+Re-running `rancher_setup.sh` rebuilds the listener list from its prompt, so pass it **all** app hostnames in their current order: `https-app-N` and its certificate `app-N-tls` follow the order you type. `gateway_add_hostname.sh` prints that list after each run.
 
 ### 6. Allow an App's Outbound Traffic
 Example: let pods labelled `app: my-api` in `prod` call HTTPS APIs on the internet but not other cluster namespaces:

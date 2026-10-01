@@ -90,6 +90,12 @@ Then:
 4. Delete the password file: `sudo shred -u /root/.rancher_bootstrap_password`.
 5. Expose apps with an `HTTPRoute`.
 
+To serve another hostname later, add a listener without re-running the setup:
+
+```bash
+bash gateway_add_hostname.sh offline.example.com      # --dry-run to validate first
+```
+
 See [rancher_setup_docs.md](rancher_setup_docs.md) for step 5, outbound network rules and troubleshooting.
 
 ## Uninstall
