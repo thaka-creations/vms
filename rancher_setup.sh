@@ -614,8 +614,8 @@ spec:
     minVersion: "1.2"
   headers:
     # Headers with underscores are a request-smuggling / header-spoofing
-    # vector (X_Forwarded_For vs X-Forwarded-For) — reject them.
-    withUnderscoresAction: RejectRequest
+    # vector (X_Forwarded_For vs X-Forwarded-For) — drop them.
+    withUnderscoresAction: DropHeader
 EOF
 
     kubectl wait --for=condition=Programmed "gateway/${GATEWAY_NAME}" \
