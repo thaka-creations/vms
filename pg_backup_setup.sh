@@ -47,11 +47,12 @@ read_inputs() {
     [[ -n "${R2_BUCKET:-}" ]]            || read -rp  "R2 bucket name: "                   R2_BUCKET
     [[ -n "${R2_ACCESS_KEY_ID:-}" ]]     || read -rp  "R2 access key ID: "                 R2_ACCESS_KEY_ID
     [[ -n "${R2_SECRET_ACCESS_KEY:-}" ]] || { read -rsp "R2 secret access key: "          R2_SECRET_ACCESS_KEY; echo; }
+    [[ -n "${S3_ENDPOINT:-}" ]]          || read -rp  "R2 jurisdiction (blank = default, eu, fedramp): " R2_JURISDICTION
     [[ -n "${REPO_PATH:-}" ]]            || read -rp  "Path inside the bucket [default: /pgbackrest/$(hostname -s)]: " REPO_PATH
     [[ -n "${HC_URL+x}" ]]               || read -rp  "Healthcheck URL for backups (optional, e.g. https://hc-ping.com/<uuid>): " HC_URL
     [[ -n "${HC_RESTORE_URL+x}" ]]       || read -rp  "Healthcheck URL for the monthly restore test (optional): " HC_RESTORE_URL
     REPO_PATH="${REPO_PATH:-/pgbackrest/$(hostname -s)}"
-    S3_ENDPOINT="${S3_ENDPOINT:-${R2_ACCOUNT_ID}.r2.cloudflarestorage.com}"
+    S3_ENDPOINT="${S3_ENDPOINT:-${R2_ACCOUNT_ID}${R2_JURISDICTION:+.${R2_JURISDICTION}}.r2.cloudflarestorage.com}"
 
     [[ "$R2_BUCKET" =~ ^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$ ]] || { error "Invalid bucket name."; exit 1; }
     [[ -n "$R2_ACCESS_KEY_ID" && -n "$R2_SECRET_ACCESS_KEY" ]] || { error "R2 credentials are required."; exit 1; }
@@ -118,7 +119,7 @@ delta=y
 
 archive-async=y
 spool-path=/var/spool/pgbackrest
-archive-push-queue-max=8GiB
+archive-push-queue-max=32GiB
 
 log-path=/var/log/pgbackrest
 log-level-console=info
@@ -149,7 +150,7 @@ configure_archiving() {
 wal_level = replica
 archive_mode = on
 archive_command = 'pgbackrest --stanza=${STANZA} archive-push %p'
-archive_timeout = 300
+archive_timeout = 60
 EOF
     chown postgres:postgres "$DROPIN"
 
@@ -263,6 +264,19 @@ log "Cluster: PostgreSQL ${PG_VERSION}/main on port ${PG_PORT}, data ${PG_DATA}"
 read_inputs
 install_pgbackrest
 write_config
+
+if [[ -n "${RESTORE_MODE:-}" ]]; then
+    success "pgBackRest configured for restore only (no archiving, stanza or timers)."
+    sudo -u postgres pgbackrest --stanza="$STANZA" info
+    echo ""
+    log "Next: stop postgres, restore, start it, then re-run this script without RESTORE_MODE:"
+    echo "    systemctl stop postgresql@${PG_VERSION}-main"
+    echo "    sudo -u postgres pgbackrest --stanza=${STANZA} --delta restore"
+    echo "    systemctl start postgresql@${PG_VERSION}-main"
+    echo "    bash $0"
+    exit 0
+fi
+
 configure_archiving
 install_restore_test
 init_repo

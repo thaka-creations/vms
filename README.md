@@ -69,9 +69,9 @@ Load them with `set -a; source <file>; set +a`. Never commit them.
 
 ### PostgreSQL backups (Cloudflare R2)
 
-pgBackRest does a full backup every Sunday, a differential backup Mon–Sat (both at 01:30), and archives WAL continuously, so you can restore to any point in time and lose at most about 5 minutes of data. Backups are encrypted with AES-256 before they leave the server. Four weeks of backups are kept. On the 1st of each month, a restore test restores the latest backup to a scratch copy and checks it.
+pgBackRest does a full backup every Sunday, a differential backup Mon–Sat (both at 01:30), and archives WAL continuously, so you can restore to any point in time and lose at most about 1 minute of data. Backups are encrypted with AES-256 before they leave the server. Four weeks of backups are kept. On the 1st of each month, a restore test restores the latest backup to a scratch copy and checks it.
 
-**1. In Cloudflare:** create a bucket, then an R2 API token with **Object Read & Write** access to **that bucket only**. Don't add lifecycle rules or bucket locks to the backup path, because pgBackRest manages retention itself and deleting its files breaks the backup chain.
+**1. In Cloudflare:** create a bucket, then an R2 API token with **Object Read & Write** access to **that bucket only**. The token's Access Key ID and Secret Access Key are what the script asks for. Don't add lifecycle rules or bucket locks to the backup path, because pgBackRest manages retention itself and deleting its files breaks the backup chain. If the bucket uses a jurisdiction (e.g. EU), give it when asked. Jurisdictional buckets only work through their own endpoint.
 
 **2. On the VM:**
 ```bash
@@ -104,7 +104,11 @@ systemctl list-timers 'pgbackrest-*'                        # next scheduled run
 journalctl -u 'pgbackrest@*' -n 50                          # recent job output
 ```
 
-**Disaster recovery** (on the same VM, or on a new one after `pg_setup.sh` + `pg_backup_setup.sh` with the **same** cipher passphrase in `/root/.pgbackrest_cipher.env`):
+**If R2 is unreachable:** WAL queues locally, up to 32 GiB. Past that, pgBackRest drops the queued WAL to keep Postgres running. Point-in-time restore is then unavailable until the next backup, though earlier backups still restore. The healthcheck flags the failed backups, which wait on the archive.
+
+**Disaster recovery.** Stop the apps first, so nothing writes while the restore runs.
+
+On the **same VM**:
 ```bash
 sudo systemctl stop postgresql@18-main
 sudo -u postgres pgbackrest --stanza=main --delta restore                                  # latest
@@ -112,7 +116,15 @@ sudo -u postgres pgbackrest --stanza=main --delta --type=time \
      --target="2026-11-09 14:30:00+03" --target-action=promote restore                    # point in time
 sudo systemctl start postgresql@18-main
 ```
-Stop the apps first, so nothing writes while the restore runs.
+
+On a **new VM**: run `pg_setup.sh` with the same Postgres version and port, then put the original cipher passphrase in `/root/.pgbackrest_cipher.env` (`PGBACKREST_CIPHER_PASS=...`, chmod 600). Then:
+```bash
+sudo RESTORE_MODE=1 bash pg_backup_setup.sh                 # configures pgBackRest only
+sudo systemctl stop postgresql@18-main
+sudo -u postgres pgbackrest --stanza=main --delta restore
+sudo systemctl start postgresql@18-main
+sudo bash pg_backup_setup.sh                                # turns archiving, checks and timers back on
+```
 
 ## 4. Kubernetes + Rancher (single VM)
 
