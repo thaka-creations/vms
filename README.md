@@ -67,6 +67,53 @@ sudo bash mongo_setup.sh            # MongoDB with auth: admin/app/read-only use
 
 Load them with `set -a; source <file>; set +a`. Never commit them.
 
+### PostgreSQL backups (Cloudflare R2)
+
+pgBackRest does a full backup every Sunday, a differential backup Mon–Sat (both at 01:30), and archives WAL continuously, so you can restore to any point in time and lose at most about 5 minutes of data. Backups are encrypted with AES-256 before they leave the server. Four weeks of backups are kept. On the 1st of each month, a restore test restores the latest backup to a scratch copy and checks it.
+
+**1. In Cloudflare:** create a bucket, then an R2 API token with **Object Read & Write** access to **that bucket only**. Don't add lifecycle rules or bucket locks to the backup path, because pgBackRest manages retention itself and deleting its files breaks the backup chain.
+
+**2. On the VM:**
+```bash
+sudo bash pg_backup_setup.sh        # asks for the account ID, bucket and token; turning on WAL archiving restarts Postgres once (a few seconds)
+```
+
+**3. Copy `/root/.pgbackrest_cipher.env` off the server** (to a password manager). Every backup is encrypted with it, and without it they can't be restored.
+
+**4. (Recommended) Monitoring:** create two checks on [healthchecks.io](https://healthchecks.io): one for backups (daily, with a 2 h grace period) and one for the restore test (monthly). Give their URLs when the script asks. If a job fails or doesn't run, you get an alert.
+
+**5. (Recommended) Data checks for the restore test:** put SQL in `/etc/pgbackrest/restore-check.sql` that raises an exception when something is wrong, and add `RESTORE_CHECK_DB=<db>` to `/etc/pgbackrest/healthcheck.env`. For example, BulkSms checks that every wallet balance equals its ledger total:
+```sql
+DO $$
+DECLARE drift int;
+BEGIN
+  SELECT count(*) INTO drift FROM bulksms.accounts_wallet w
+    LEFT JOIN (SELECT wallet_id, sum(amount_cents) s FROM bulksms.billing_ledgerentry GROUP BY 1) l
+      ON l.wallet_id = w.id
+   WHERE coalesce(l.s, 0) <> (w.amount * 100)::bigint;
+  IF drift > 0 THEN RAISE EXCEPTION '% wallet(s) do not match the ledger', drift; END IF;
+END $$;
+```
+
+**Everyday commands:**
+```bash
+sudo -u postgres pgbackrest --stanza=main info              # backups, sizes, WAL range
+sudo systemctl start pgbackrest@diff                        # back up now (full|diff)
+sudo bash pg_restore_test.sh                                # run the restore test now
+systemctl list-timers 'pgbackrest-*'                        # next scheduled runs
+journalctl -u 'pgbackrest@*' -n 50                          # recent job output
+```
+
+**Disaster recovery** (on the same VM, or on a new one after `pg_setup.sh` + `pg_backup_setup.sh` with the **same** cipher passphrase in `/root/.pgbackrest_cipher.env`):
+```bash
+sudo systemctl stop postgresql@18-main
+sudo -u postgres pgbackrest --stanza=main --delta restore                                  # latest
+sudo -u postgres pgbackrest --stanza=main --delta --type=time \
+     --target="2026-11-09 14:30:00+03" --target-action=promote restore                    # point in time
+sudo systemctl start postgresql@18-main
+```
+Stop the apps first, so nothing writes while the restore runs.
+
 ## 4. Kubernetes + Rancher (single VM)
 
 ```bash
